@@ -1,5 +1,23 @@
-﻿.vs/
+# Build outputs
 bin/
 obj/
+
+# Visual Studio
+.vs/
 *.user
 *.suo
+*.cache
+*.log
+
+# Rider / JetBrains
+.idea/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# NuGet packages folder (if present)
+packages/
+
+# Optional: lock files you don't want tracked (keep if you prefer)
+# packages.lock.json

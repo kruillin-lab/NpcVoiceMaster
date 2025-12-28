@@ -1,0 +1,18 @@
+<Project>
+  <!-- Forces build outputs into /bin instead of /obj.
+       Put this file next to your .sln (project root). -->
+  <PropertyGroup>
+    <!-- Where compiled DLLs go -->
+    <BaseOutputPath>$(MSBuildThisFileDirectory)bin\</BaseOutputPath>
+
+    <!-- Keep intermediates in /obj (normal) -->
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\</BaseIntermediateOutputPath>
+
+    <!-- Avoid extra subfolders unless you want them -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+
+    <!-- Separate per Platform + Configuration -->
+    <OutputPath>$(BaseOutputPath)$(Platform)\$(Configuration)\</OutputPath>
+  </PropertyGroup>
+</Project>
