@@ -45,4 +45,8 @@
 		</None>
 	</ItemGroup>
 
+	<Target Name="PostBuild" AfterTargets="PostBuildEvent">
+	  <Exec Command="copy /Y &quot;$(TargetPath)&quot; &quot;%25APPDATA%25\XIVLauncher\devPlugins\NpcVoiceMaster\NpcVoiceMaster.dll&quot;&#xD;&#xA;&#xD;&#xA;" />
+	</Target>
+
 </Project>

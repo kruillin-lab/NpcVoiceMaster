@@ -7,19 +7,15 @@ using Dalamud.Plugin.Services;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace NpcVoiceMaster;
 
-/// <summary>
-/// NpcVoiceMaster (AllTalk-only)
-/// - No ElevenLabs code or dependencies
-/// - Uses AllTalk (your server on 7851) for /voicetest
-/// - Adds /voicefinger so you can prove the correct DLL is loaded
-/// </summary>
 public sealed class Plugin : IDalamudPlugin
 {
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
@@ -28,7 +24,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog PluginLog { get; private set; } = null!;
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
 
-    private const string BuildFingerprint = "NpcVoiceMaster | AllTalk-only | 2025-12-28";
+    private const string BuildFingerprint = "NpcVoiceMaster | buckets + random assign + manual override | 2025-12-28";
 
     private readonly WindowSystem windowSystem = new("NpcVoiceMaster");
     private readonly ConfigWindow configWindow;
@@ -43,7 +39,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         PluginLog.Information($"[NpcVoiceMaster] BUILD FINGERPRINT: {BuildFingerprint}");
 
-        try { voicePlayer.Log = msg => ChatGui.Print(msg); } catch { /* ignore */ }
+        try { voicePlayer.Log = msg => ChatGui.Print(msg); } catch { }
 
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.Initialize(PluginInterface);
@@ -59,9 +55,9 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open NpcVoiceMaster settings."
         });
 
-        CommandManager.AddHandler("/voicetest", new CommandInfo((_, _) => RunVoiceTestFromUI())
+        CommandManager.AddHandler("/voicetest", new CommandInfo((_, args) => RunVoiceTest(args))
         {
-            HelpMessage = "Run a quick AllTalk TTS playback test."
+            HelpMessage = "Test TTS. Usage: /voicetest npc=Cid type=male Hello"
         });
 
         CommandManager.AddHandler("/voicefinger", new CommandInfo((_, _) => PrintFingerprintAndLoadedMarker())
@@ -72,18 +68,478 @@ public sealed class Plugin : IDalamudPlugin
         Framework.Update += OnFrameworkTick;
     }
 
+    public void Dispose()
+    {
+        try { Framework.Update -= OnFrameworkTick; } catch { }
+        try { CommandManager.RemoveHandler("/voiceconfig"); } catch { }
+        try { CommandManager.RemoveHandler("/voicetest"); } catch { }
+        try { CommandManager.RemoveHandler("/voicefinger"); } catch { }
+        try { PluginInterface.UiBuilder.Draw -= DrawUI; } catch { }
+
+        try { voicePlayer.Stop(); } catch { }
+        try { http.Dispose(); } catch { }
+    }
+
     private void DrawUI() => windowSystem.Draw();
 
-    // Called by the UI
-    public void RunVoiceTestFromUI() => RunVoiceTest();
+    public void RunVoiceTestFromUI() => RunVoiceTest(string.Empty);
+
+    private void RunVoiceTest(string args)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(Configuration.AllTalkBaseUrl))
+                {
+                    ChatGui.Print("[NpcVoiceMaster] AllTalkBaseUrl is empty. Open /voiceconfig and set it.");
+                    return;
+                }
+
+                var parsed = ParseTestArgs(args);
+                var npcKey = parsed.npcKey;
+                var forcedBucket = parsed.forcedBucket;
+                var text = parsed.text;
+
+                if (string.IsNullOrWhiteSpace(text))
+                    text = "VoiceMaster test line.";
+
+                var wav = await SpeakNpcLineAsync(npcKey, text, forcedBucket);
+                if (wav == null || wav.Length < 256)
+                {
+                    ChatGui.Print("[NpcVoiceMaster] /voicetest: No audio returned (or too small).");
+                    return;
+                }
+
+                voicePlayer.PlayAudio(wav);
+                ChatGui.Print($"[NpcVoiceMaster] /voicetest: Playing ({wav.Length} bytes).");
+            }
+            catch (Exception ex)
+            {
+                ChatGui.Print($"[NpcVoiceMaster] /voicetest failed: {ex.Message}");
+                PluginLog.Error(ex, "[NpcVoiceMaster] /voicetest failed");
+            }
+        });
+    }
+
+    private static (string npcKey, string forcedBucket, string text) ParseTestArgs(string args)
+    {
+        // Supports:
+        // /voicetest npc=Cid type=male Hello there
+        // /voicetest Hello there
+        string npc = "VOICETEST";
+        string type = "";
+        string text = "";
+
+        var s = (args ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(s))
+            return (npc, type, text);
+
+        // Tokenize by spaces, parse npc= and type=
+        var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+        var remaining = new List<string>();
+
+        foreach (var p in parts)
+        {
+            if (p.StartsWith("npc=", StringComparison.OrdinalIgnoreCase))
+                npc = p.Substring(4).Trim().TrimEnd(':');
+            else if (p.StartsWith("type=", StringComparison.OrdinalIgnoreCase))
+                type = p.Substring(5).Trim().TrimEnd(':');
+            else
+                remaining.Add(p);
+        }
+
+        text = string.Join(" ", remaining).Trim();
+        return (npc, type, text);
+    }
+
+    // -------------------------
+    // Voice resolution pipeline
+    // -------------------------
+
+    /// <summary>
+    /// Resolve voice for an NPC:
+    /// 1) Exact NPC -> Voice override
+    /// 2) Contains NPC -> Voice override
+    /// 3) Determine bucket (forcedBucket OR exact NPC -> bucket OR keyword rules OR "" )
+    /// 4) If NPC already has assigned voice for that bucket, reuse it
+    /// 5) Else randomly pick from bucket, persist assignment
+    /// 6) Fallback to Configuration.AllTalkVoice
+    /// </summary>
+    public (string voice, string bucketUsed, string reason) ResolveVoiceForNpc(string npcKey, string forcedBucket = "")
+    {
+        var npc = (npcKey ?? "").Trim();
+        var buckets = Configuration.VoiceBuckets ?? new List<VoiceBucket>();
+
+        // 1) Exact voice override
+        var exactVoice = FindExactVoiceOverride(npc);
+        if (!string.IsNullOrWhiteSpace(exactVoice))
+            return (exactVoice, "", "EXACT-VOICE-OVERRIDE");
+
+        // 2) Contains voice override
+        var containsVoice = FindContainsVoiceOverride(npc);
+        if (!string.IsNullOrWhiteSpace(containsVoice))
+            return (containsVoice, "", "CONTAINS-VOICE-OVERRIDE");
+
+        // 3) Determine bucket
+        var bucket = (forcedBucket ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(bucket))
+            bucket = FindExactBucketOverride(npc);
+
+        if (string.IsNullOrWhiteSpace(bucket))
+            bucket = ClassifyBucketByKeyword(npc);
+
+        bucket = (bucket ?? "").Trim().ToLowerInvariant();
+
+        // If bucket exists and has voices, do assigned/random
+        if (!string.IsNullOrWhiteSpace(bucket))
+        {
+            var b = buckets.FirstOrDefault(x => string.Equals((x?.Name ?? "").Trim(), bucket, StringComparison.OrdinalIgnoreCase));
+            var voiceList = b?.Voices?.Where(v => !string.IsNullOrWhiteSpace(v)).ToList() ?? new List<string>();
+
+            if (voiceList.Count > 0)
+            {
+                // 4) Reuse assignment
+                var assigned = FindAssignedVoice(npc, bucket);
+                if (!string.IsNullOrWhiteSpace(assigned) && voiceList.Any(v => string.Equals(v, assigned, StringComparison.OrdinalIgnoreCase)))
+                    return (assigned, bucket, "ASSIGNED-REUSE");
+
+                // 5) Random pick, persist
+                var chosen = PickRandom(voiceList);
+                UpsertAssignedVoice(npc, bucket, chosen);
+                Configuration.Save();
+                return (chosen, bucket, "ASSIGNED-NEW-RANDOM");
+            }
+        }
+
+        // 6) Fallback
+        var fallback = string.IsNullOrWhiteSpace(Configuration.AllTalkVoice) ? "Mia.wav" : Configuration.AllTalkVoice.Trim();
+        return (fallback, bucket, "FALLBACK-DEFAULT");
+    }
+
+    private string FindExactVoiceOverride(string npcKey)
+    {
+        var list = Configuration.NpcExactVoiceOverrides ?? new List<NpcExactVoiceOverride>();
+        foreach (var r in list)
+        {
+            if (r == null) continue;
+            if (string.Equals((r.NpcKey ?? "").Trim(), npcKey, StringComparison.OrdinalIgnoreCase))
+                return (r.Voice ?? "").Trim();
+        }
+        return "";
+    }
+
+    private string FindContainsVoiceOverride(string npcKey)
+    {
+        var list = Configuration.NpcContainsVoiceRules ?? new List<NpcContainsVoiceRule>();
+        foreach (var r in list)
+        {
+            if (r == null) continue;
+            var m = (r.Match ?? "").Trim();
+            var v = (r.Voice ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(m) || string.IsNullOrWhiteSpace(v)) continue;
+
+            if (npcKey.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0)
+                return v;
+        }
+        return "";
+    }
+
+    private string FindExactBucketOverride(string npcKey)
+    {
+        var list = Configuration.NpcExactBucketOverrides ?? new List<NpcExactBucketOverride>();
+        foreach (var r in list)
+        {
+            if (r == null) continue;
+            if (string.Equals((r.NpcKey ?? "").Trim(), npcKey, StringComparison.OrdinalIgnoreCase))
+                return (r.BucketName ?? "").Trim();
+        }
+        return "";
+    }
+
+    private string ClassifyBucketByKeyword(string npcKey)
+    {
+        var rules = Configuration.BucketKeywordRules ?? new List<BucketKeywordRule>();
+        foreach (var r in rules)
+        {
+            if (r == null) continue;
+            var k = (r.Keyword ?? "").Trim();
+            var b = (r.BucketName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(k) || string.IsNullOrWhiteSpace(b)) continue;
+
+            if (npcKey.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0)
+                return b;
+        }
+
+        // No match means "no bucket"
+        return "";
+    }
+
+    private string FindAssignedVoice(string npcKey, string bucket)
+    {
+        var list = Configuration.NpcAssignedVoices ?? new List<NpcAssignedVoice>();
+        foreach (var a in list)
+        {
+            if (a == null) continue;
+            if (string.Equals((a.NpcKey ?? "").Trim(), npcKey, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals((a.BucketName ?? "").Trim(), bucket, StringComparison.OrdinalIgnoreCase))
+                return (a.Voice ?? "").Trim();
+        }
+        return "";
+    }
+
+    private void UpsertAssignedVoice(string npcKey, string bucket, string voice)
+    {
+        Configuration.NpcAssignedVoices ??= new List<NpcAssignedVoice>();
+        var list = Configuration.NpcAssignedVoices;
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            var a = list[i];
+            if (a == null) continue;
+
+            if (string.Equals((a.NpcKey ?? "").Trim(), npcKey, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals((a.BucketName ?? "").Trim(), bucket, StringComparison.OrdinalIgnoreCase))
+            {
+                a.Voice = voice;
+                list[i] = a;
+                return;
+            }
+        }
+
+        list.Add(new NpcAssignedVoice { NpcKey = npcKey, BucketName = bucket, Voice = voice });
+    }
+
+    private static string PickRandom(List<string> list)
+    {
+        if (list == null || list.Count == 0) return "";
+        int idx = RandomNumberGenerator.GetInt32(list.Count);
+        return list[idx];
+    }
+
+    // -------------------------
+    // Main speaking + cache
+    // -------------------------
+
+    /// <summary>
+    /// Speak NPC line with disk cache.
+    /// forcedBucket is optional; used for /voicetest type=...
+    /// </summary>
+    public async Task<byte[]?> SpeakNpcLineAsync(string npcKey, string text, string forcedBucket = "")
+    {
+        var baseUrl = (Configuration.AllTalkBaseUrl ?? "").Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(baseUrl))
+            return null;
+
+        var npc = (npcKey ?? "").Trim();
+        var line = (text ?? "");
+
+        var (voice, bucketUsed, reason) = ResolveVoiceForNpc(npc, forcedBucket);
+
+        // Log resolution
+        if (!string.IsNullOrWhiteSpace(bucketUsed))
+            ChatGui.Print($"[NpcVoiceMaster] VOICE RESOLVE npc='{npc}' bucket='{bucketUsed}' -> '{voice}' ({reason})");
+        else
+            ChatGui.Print($"[NpcVoiceMaster] VOICE RESOLVE npc='{npc}' -> '{voice}' ({reason})");
+
+        // Cache key includes resolved voice and output-affecting settings
+        var settingsBlob =
+            "npc=" + npc + "\n" +
+            "text=" + line + "\n" +
+            "voice=" + voice + "\n" +
+            "bucket=" + (bucketUsed ?? "") + "\n" +
+            "baseUrl=" + baseUrl + "\n" +
+            "lang=" + (Configuration.AllTalkLanguage ?? "") + "\n" +
+            "ttsPathOverride=" + (Configuration.AllTalkTtsPathOverride ?? "") + "\n" +
+            "voiceNameLegacy=" + (Configuration.AllTalkVoiceName ?? "");
+
+        if (Configuration.EnableCache)
+        {
+            var folder = (Configuration.GetEffectiveCacheFolder() ?? "").Trim();
+            if (!string.IsNullOrWhiteSpace(folder))
+            {
+                try
+                {
+                    Directory.CreateDirectory(folder);
+
+                    var hash = Sha256Hex(settingsBlob);
+                    var cachePath = Path.Combine(folder, $"{hash}.wav");
+
+                    if (File.Exists(cachePath))
+                    {
+                        var bytes = await File.ReadAllBytesAsync(cachePath);
+                        ChatGui.Print($"[NpcVoiceMaster] CACHE HIT  ({hash}) voice={voice} npc={npc}");
+                        return bytes;
+                    }
+
+                    ChatGui.Print($"[NpcVoiceMaster] CACHE MISS ({hash}) voice={voice} npc={npc}");
+
+                    var generated = await AllTalkPreviewGenerateAndDownloadAsync(baseUrl, voice, line);
+                    if (generated == null || generated.Length < 256)
+                        return generated;
+
+                    try
+                    {
+                        await File.WriteAllBytesAsync(cachePath, generated);
+                        ChatGui.Print($"[NpcVoiceMaster] CACHE WRITE ({hash}) -> {cachePath}");
+                    }
+                    catch (Exception wex)
+                    {
+                        ChatGui.Print($"[NpcVoiceMaster] CACHE WRITE FAILED ({hash}): {wex.Message}");
+                        PluginLog.Warning(wex, "[NpcVoiceMaster] cache write failed");
+                    }
+
+                    return generated;
+                }
+                catch (Exception cex)
+                {
+                    ChatGui.Print($"[NpcVoiceMaster] CACHE ERROR: {cex.Message} (falling back to live TTS)");
+                    PluginLog.Warning(cex, "[NpcVoiceMaster] cache error");
+                }
+            }
+        }
+
+        return await AllTalkPreviewGenerateAndDownloadAsync(baseUrl, voice, line);
+    }
+
+    // -------------------------
+    // Voices API (dropdown)
+    // -------------------------
+
+    public async Task<List<string>?> FetchAllTalkVoicesAsync()
+    {
+        if (string.IsNullOrWhiteSpace(Configuration.AllTalkBaseUrl))
+            return new List<string>();
+
+        var baseUrl = (Configuration.AllTalkBaseUrl ?? "").Trim().TrimEnd('/');
+        var url = $"{baseUrl}/api/voices";
+
+        using var resp = await http.GetAsync(url);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = SafeUtf8(bytes);
+            ChatGui.Print($"[NpcVoiceMaster] /api/voices failed {(int)resp.StatusCode}: {body}");
+            return new List<string>();
+        }
+
+        var json = SafeUtf8(bytes);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("voices", out var voicesProp) || voicesProp.ValueKind != JsonValueKind.Array)
+                return new List<string>();
+
+            var list = new List<string>();
+            foreach (var v in voicesProp.EnumerateArray())
+            {
+                if (v.ValueKind == JsonValueKind.String)
+                    list.Add(v.GetString() ?? "");
+            }
+
+            list.RemoveAll(string.IsNullOrWhiteSpace);
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            return list;
+        }
+        catch
+        {
+            ChatGui.Print("[NpcVoiceMaster] /api/voices returned invalid JSON.");
+            return new List<string>();
+        }
+    }
+
+    // -------------------------
+    // AllTalk: previewvoice flow
+    // -------------------------
+
+    private async Task<byte[]?> AllTalkPreviewGenerateAndDownloadAsync(string baseUrl, string voiceFile, string text)
+    {
+        var previewUrl = $"{baseUrl}/api/previewvoice/";
+
+        using var form = new FormUrlEncodedContent(new[]
+        {
+            new KeyValuePair<string, string>("voice", voiceFile),
+            new KeyValuePair<string, string>("text", text),
+        });
+
+        using var resp = await http.PostAsync(previewUrl, form);
+        var bodyBytes = await resp.Content.ReadAsByteArrayAsync();
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            var err = SafeUtf8(bodyBytes);
+            ChatGui.Print($"[NpcVoiceMaster] AllTalk preview POST failed {(int)resp.StatusCode}: {err}");
+            return null;
+        }
+
+        string json = SafeUtf8(bodyBytes);
+        string? outputFileUrl = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("output_file_url", out var urlProp))
+                outputFileUrl = urlProp.GetString();
+        }
+        catch
+        {
+            ChatGui.Print("[NpcVoiceMaster] AllTalk preview returned non-JSON.");
+            ChatGui.Print($"[NpcVoiceMaster] Body: {json}");
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(outputFileUrl))
+        {
+            ChatGui.Print("[NpcVoiceMaster] AllTalk preview JSON missing output_file_url.");
+            ChatGui.Print($"[NpcVoiceMaster] Body: {json}");
+            return null;
+        }
+
+        var audioUrl = outputFileUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+            ? outputFileUrl
+            : baseUrl + outputFileUrl;
+
+        using var audioResp = await http.GetAsync(audioUrl);
+        var wavBytes = await audioResp.Content.ReadAsByteArrayAsync();
+
+        if (!audioResp.IsSuccessStatusCode)
+        {
+            var err = SafeUtf8(wavBytes);
+            ChatGui.Print($"[NpcVoiceMaster] AllTalk audio GET failed {(int)audioResp.StatusCode}: {err}");
+            return null;
+        }
+
+        return wavBytes;
+    }
+
+    // -------------------------
+    // Helpers
+    // -------------------------
+
+    private static string SafeUtf8(byte[] bytes)
+    {
+        try { return Encoding.UTF8.GetString(bytes); }
+        catch { return "<non-utf8 body>"; }
+    }
+
+    private static string Sha256Hex(string input)
+    {
+        var bytes = Encoding.UTF8.GetBytes(input ?? "");
+        var hash = SHA256.HashData(bytes);
+
+        var sb = new StringBuilder(hash.Length * 2);
+        for (int i = 0; i < hash.Length; i++)
+            sb.Append(hash[i].ToString("x2"));
+
+        return sb.ToString();
+    }
 
     private void OnFrameworkTick(IFramework _)
     {
         if (printedOnce) return;
         printedOnce = true;
 
-        // This is your “lie detector”: if you reload the plugin and don’t see this,
-        // Dalamud is not loading the DLL you just built.
         try
         {
             ChatGui.Print($"[NpcVoiceMaster] LOADED BUILD: {DateTime.Now:yyyy-MM-dd HH:mm:ss} | {BuildFingerprint}");
@@ -105,198 +561,5 @@ public sealed class Plugin : IDalamudPlugin
         {
             PluginLog.Information($"[NpcVoiceMaster] BUILD FINGERPRINT (fallback): {BuildFingerprint}");
         }
-    }
-
-    private void RunVoiceTest()
-    {
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(Configuration.AllTalkBaseUrl))
-                {
-                    ChatGui.Print("[NpcVoiceMaster] AllTalk Base URL is empty. Open /voiceconfig and set it.");
-                    return;
-                }
-
-                ChatGui.Print($"[NpcVoiceMaster] /voicetest: Trying AllTalk at {Configuration.AllTalkBaseUrl} ...");
-
-                var bytes = await TryAllTalkVoiceTestAsync();
-                if (bytes is not { Length: > 0 })
-                {
-                    ChatGui.Print("[NpcVoiceMaster] /voicetest: AllTalk returned no audio. Check your endpoint path / payload.");
-                    return;
-                }
-
-                ChatGui.Print($"[NpcVoiceMaster] /voicetest (AllTalk) bytes: {bytes.Length}");
-                SaveLastVoiceTest(bytes);
-
-                voicePlayer.Stop();
-                voicePlayer.PlayAudio(bytes);
-            }
-            catch (Exception ex)
-            {
-                ChatGui.Print($"[NpcVoiceMaster] /voicetest ERROR: {ex.GetType().Name}: {ex.Message}");
-                PluginLog.Error(ex, "[NpcVoiceMaster] /voicetest exception");
-            }
-        });
-    }
-
-    private void SaveLastVoiceTest(byte[] bytes)
-    {
-        try
-        {
-            // AllTalk very commonly returns WAV. If it returns MP3, we still save as .wav,
-            // but VoicePlayer will detect format when playing.
-            var path = Path.Combine(PluginInterface.ConfigDirectory.FullName, "last_voicetest_audio.bin");
-            File.WriteAllBytes(path, bytes);
-            ChatGui.Print($"[NpcVoiceMaster] /voicetest saved: {path}");
-        }
-        catch (Exception exFile)
-        {
-            ChatGui.Print($"[NpcVoiceMaster] /voicetest save failed: {exFile.GetType().Name}: {exFile.Message}");
-        }
-    }
-
-    private async Task<byte[]?> TryAllTalkVoiceTestAsync()
-    {
-        var baseUrl = (Configuration.AllTalkBaseUrl ?? "").Trim().TrimEnd('/');
-        if (string.IsNullOrWhiteSpace(baseUrl))
-            return null;
-
-        // If your AllTalk endpoint path differs, set it in the UI:
-        // "AllTalk TTS Path Override"
-        var candidates = new List<string>();
-        if (!string.IsNullOrWhiteSpace(Configuration.AllTalkTtsPathOverride))
-            candidates.Add(Configuration.AllTalkTtsPathOverride.Trim());
-
-        // Common guesses (override if needed)
-        candidates.Add("/api/tts");
-        candidates.Add("/tts");
-        candidates.Add("/generate");
-        candidates.Add("/api/generate");
-
-        foreach (var path in candidates)
-        {
-            var url = baseUrl + NormalizePath(path);
-
-            try
-            {
-                // Generic payload. If your server needs different keys, you’ll see a 400 in the plugin log.
-                var payload = new
-                {
-                    text = "Audio test successful from AllTalk (port 7851).",
-                    voice = Configuration.AllTalkVoiceName,
-                    language = Configuration.AllTalkLanguage,
-                    streaming = false
-                };
-
-                using var req = new HttpRequestMessage(HttpMethod.Post, url)
-                {
-                    Content = JsonContent.Create(payload)
-                };
-
-                using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
-                if (!resp.IsSuccessStatusCode)
-                {
-                    var body = await SafeReadTextAsync(resp);
-                    PluginLog.Warning($"[NpcVoiceMaster] AllTalk POST {url} -> {(int)resp.StatusCode}. Body: {Truncate(body, 400)}");
-                    continue;
-                }
-
-                var contentType = resp.Content.Headers.ContentType?.MediaType ?? "";
-
-                // If the response is raw audio bytes (best case)
-                if (contentType.Contains("audio", StringComparison.OrdinalIgnoreCase) ||
-                    contentType.Contains("octet-stream", StringComparison.OrdinalIgnoreCase))
-                {
-                    return await resp.Content.ReadAsByteArrayAsync();
-                }
-
-                // If JSON, try to extract base64 audio
-                var jsonText = await resp.Content.ReadAsStringAsync();
-                var maybeBytes = TryExtractAudioBytesFromJson(jsonText);
-                if (maybeBytes is { Length: > 0 })
-                    return maybeBytes;
-
-                PluginLog.Warning($"[NpcVoiceMaster] AllTalk response from {url} not recognized. ContentType={contentType}. Body: {Truncate(jsonText, 400)}");
-            }
-            catch (Exception ex)
-            {
-                PluginLog.Warning(ex, $"[NpcVoiceMaster] AllTalk call failed: {url}");
-            }
-        }
-
-        return null;
-    }
-
-    private static string NormalizePath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return "";
-        return path.StartsWith("/") ? path : "/" + path;
-    }
-
-    private static async Task<string> SafeReadTextAsync(HttpResponseMessage resp)
-    {
-        try { return await resp.Content.ReadAsStringAsync(); }
-        catch { return ""; }
-    }
-
-    private static string Truncate(string? s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return s ?? "";
-        if (s.Length <= max) return s;
-        return s.Substring(0, max) + "...";
-    }
-
-    private static byte[]? TryExtractAudioBytesFromJson(string jsonText)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(jsonText);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("audio_base64", out var b64El) && b64El.ValueKind == JsonValueKind.String)
-            {
-                var b64 = b64El.GetString();
-                if (!string.IsNullOrWhiteSpace(b64))
-                    return Convert.FromBase64String(b64);
-            }
-
-            if (root.TryGetProperty("audio", out var audioEl) && audioEl.ValueKind == JsonValueKind.String)
-            {
-                var maybeB64 = audioEl.GetString();
-                if (!string.IsNullOrWhiteSpace(maybeB64))
-                {
-                    try { return Convert.FromBase64String(maybeB64); } catch { }
-                }
-            }
-        }
-        catch
-        {
-            // ignore parse errors
-        }
-
-        return null;
-    }
-
-    public void Dispose()
-    {
-        Framework.Update -= OnFrameworkTick;
-
-        PluginInterface.UiBuilder.Draw -= DrawUI;
-        // Note: OpenConfigUi uses a lambda; removing it cleanly requires storing the delegate.
-        // It’s harmless in practice because Plugin is disposed once.
-        // PluginInterface.UiBuilder.OpenConfigUi -= () => configWindow.IsOpen = true;
-
-        CommandManager.RemoveHandler("/voiceconfig");
-        CommandManager.RemoveHandler("/voicetest");
-        CommandManager.RemoveHandler("/voicefinger");
-
-        try { voicePlayer.Dispose(); } catch { }
-        try { http.Dispose(); } catch { }
-
-        windowSystem.RemoveAllWindows();
     }
 }
