@@ -1,0 +1,14 @@
+{
+  "Author": "YourName",
+  "Name": "NpcVoiceMaster",
+  "InternalName": "NpcVoiceMaster",
+  "AssemblyVersion": "1.0.0.0",
+  "Description": "AI Text-to-Speech for FFXIV NPCs using ElevenLabs.",
+  "Punchline": "Giving a voice to the voiceless.",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 14,
+  "LoadRequiredState": 0,
+  "LoadSync": false,
+  "CanUnloadAsync": true,
+  "LoadPriority": 0
+}

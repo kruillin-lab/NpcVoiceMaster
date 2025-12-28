@@ -1,0 +1,31 @@
+﻿<Project Sdk="Dalamud.NET.Sdk/14.0.1">
+
+	<PropertyGroup>
+		<PackageId>NpcVoiceMaster</PackageId>
+		<Version>1.0.0.0</Version>
+
+		<!-- API 14 requires .NET 10 -->
+		<TargetFramework>net10.0-windows</TargetFramework>
+
+		<Platforms>x64</Platforms>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+		<!-- Build straight into the devPlugins folder -->
+		<OutputPath>$(AppData)\Roaming\XIVLauncher\devPlugins\NpcVoiceMaster\</OutputPath>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="ElevenLabs-DotNet" Version="3.7.1" />
+		<PackageReference Include="NAudio" Version="2.2.1" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="FFXIVClientStructs">
+			<HintPath>$(AppData)\Roaming\XIVLauncher\addon\Hooks\dev\FFXIVClientStructs.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
+
+</Project>
