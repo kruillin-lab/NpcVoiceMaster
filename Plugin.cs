@@ -1,112 +1,158 @@
 ﻿using Dalamud.Game.Command;
 using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
+using Dalamud.Plugin.Services;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Dalamud.Game.Text.SeStringHandling;
-
 
 namespace NPCVoiceMaster
 {
     public sealed class Plugin : IDalamudPlugin
     {
         public string Name => "NPC Voice Master";
-        private const string CommandName = "/npcvoice";
 
-        private IDalamudPluginInterface PluginInterface { get; init; }
-        private Dalamud.Plugin.Services.ICommandManager CommandManager { get; init; }
+        private const string Cmd1 = "/npcvoice";
+        private const string Cmd2 = "/nvm";
 
-        public Configuration Configuration { get; init; }
-        public WindowSystem WindowSystem { get; init; }
-        private ConfigWindow ConfigWindow { get; init; }
+        private readonly IDalamudPluginInterface _pi;
+        private readonly ICommandManager _commands;
+
+        public Configuration Configuration { get; private set; }
+
+        public WindowSystem WindowSystem { get; }
+        private ConfigWindow ConfigWindow { get; }
 
         private readonly HttpClient _httpClient = new HttpClient();
         private readonly VoicePlayer _player = new VoicePlayer();
         private readonly Random _rng = new Random();
 
-        public Plugin(IDalamudPluginInterface pluginInterface, Dalamud.Plugin.Services.ICommandManager commandManager)
+        // Split on anything not letter/number (so "woman_Alice.wav" => ["woman","alice"])
+        private static readonly Regex TokenSplit = new Regex(@"[^a-zA-Z0-9]+", RegexOptions.Compiled);
+
+        public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager)
         {
-            PluginInterface = pluginInterface;
-            CommandManager = commandManager;
+            _pi = pluginInterface;
+            _commands = commandManager;
 
-            // IMPORTANT: enables [PluginService] injection in Svc.cs
-            pluginInterface.Create<Svc>();
+            _pi.Create<Svc>();
 
-            // Load Config
-            Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-            Configuration.Initialize(PluginInterface);
+            Configuration = LoadConfigurationSafe();
 
-            // UI Setup
-            WindowSystem = new WindowSystem("NPCVoiceMaster");
+            WindowSystem = new WindowSystem("NpcVoiceMaster");
             ConfigWindow = new ConfigWindow(this);
             WindowSystem.AddWindow(ConfigWindow);
 
-            PluginInterface.UiBuilder.Draw += DrawUI;
-            PluginInterface.UiBuilder.OpenConfigUi += DrawConfigUI;
+            _pi.UiBuilder.Draw += DrawUI;
+            _pi.UiBuilder.OpenConfigUi += DrawConfigUI;
 
-            // Command
-            CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
-            {
-                HelpMessage = "Opens the NPC Voice Master config."
-            });
+            _commands.AddHandler(Cmd1, new CommandInfo(OnCommand) { HelpMessage = "Open NPC Voice Master config." });
+            _commands.AddHandler(Cmd2, new CommandInfo(OnCommand) { HelpMessage = "Open NPC Voice Master config." });
 
-            // Wire player logging into Dalamud log
-            _player.Log = msg => Svc.Log.Debug(msg);
-
-            // Hook chat
             Svc.Chat.ChatMessage += OnChatMessage;
-            Svc.Log.Information("[NPCVoiceMaster] Loaded. Listening for NPC dialogue.");
+
+            Svc.Log.Information($"[NpcVoiceMaster] Loaded. Commands: {Cmd1}, {Cmd2}");
+            Svc.Chat.Print($"[NpcVoiceMaster] Loaded. Type {Cmd2} to open config.");
         }
 
         public void Dispose()
         {
             Svc.Chat.ChatMessage -= OnChatMessage;
 
+            _commands.RemoveHandler(Cmd1);
+            _commands.RemoveHandler(Cmd2);
+
+            _pi.UiBuilder.Draw -= DrawUI;
+            _pi.UiBuilder.OpenConfigUi -= DrawConfigUI;
+
             WindowSystem.RemoveAllWindows();
             ConfigWindow.Dispose();
-
-            CommandManager.RemoveHandler(CommandName);
-            PluginInterface.UiBuilder.Draw -= DrawUI;
-            PluginInterface.UiBuilder.OpenConfigUi -= DrawConfigUI;
 
             _player.Dispose();
             _httpClient.Dispose();
         }
 
+        private Configuration LoadConfigurationSafe()
+        {
+            try
+            {
+                var cfg = _pi.GetPluginConfig() as Configuration;
+                if (cfg == null)
+                {
+                    cfg = new Configuration();
+                    cfg.Initialize(_pi);
+                    cfg.Save();
+                    return cfg;
+                }
+
+                cfg.Initialize(_pi);
+                return cfg;
+            }
+            catch (Exception ex)
+            {
+                Svc.Log.Error(ex, "[NpcVoiceMaster] Config failed to load (bad/old JSON). Resetting config to defaults.");
+
+                var cfg = new Configuration();
+                cfg.Initialize(_pi);
+                cfg.Save();
+
+                try { Svc.Chat.Print("[NpcVoiceMaster] Your saved config was incompatible and was reset to defaults."); }
+                catch { }
+
+                return cfg;
+            }
+        }
+
         private void OnCommand(string command, string args)
         {
+            Svc.Chat.Print($"[NpcVoiceMaster] Command received: {command}");
             ConfigWindow.IsOpen = !ConfigWindow.IsOpen;
+            Svc.Log.Information($"[NpcVoiceMaster] Command fired: {command}. ConfigWindow.IsOpen={ConfigWindow.IsOpen}");
         }
 
         private void DrawUI() => WindowSystem.Draw();
-
         private void DrawConfigUI() => ConfigWindow.IsOpen = true;
+
+        // =========================
+        //  NPC Detection + TTS
+        // =========================
 
         private void OnChatMessage(XivChatType type, int timestamp, ref SeString sender, ref SeString message, ref bool isHandled)
         {
             if (!Configuration.Enabled)
                 return;
 
-            // Only speak NPC Dialogue (and the announcement variant)
-            if (type != XivChatType.NPCDialogue && type != XivChatType.NPCDialogueAnnouncements)
-                return;
+            var npcName = (sender.TextValue ?? "").Trim();
+            var text = (message.TextValue ?? "").Trim();
 
-            var npcName = sender.TextValue?.Trim();
-            var text = message.TextValue?.Trim();
+            if (Configuration.DebugLogCandidateChat)
+            {
+                if (!string.IsNullOrWhiteSpace(text))
+                    Svc.Log.Debug($"[NpcVoiceMaster] CHAT type={(ushort)type} sender='{npcName}' msg='{text}'");
+            }
+
+            var isNpcDialogue =
+                type == XivChatType.NPCDialogue ||
+                type == XivChatType.NPCDialogueAnnouncements;
+
+            if (!isNpcDialogue)
+                return;
 
             if (string.IsNullOrWhiteSpace(text))
                 return;
 
-            // Sometimes sender is empty; still speak the line, but we’ll treat speaker as "Unknown"
             if (string.IsNullOrWhiteSpace(npcName))
                 npcName = "Unknown";
 
-            // Fire and forget (don’t block chat thread)
+            Svc.Log.Debug($"[NpcVoiceMaster] NPC Dialogue detected: '{npcName}' -> '{text}'");
+
             _ = Task.Run(async () =>
             {
                 try
@@ -114,29 +160,28 @@ namespace NPCVoiceMaster
                     var voice = ResolveVoiceForNpc(npcName);
                     if (string.IsNullOrWhiteSpace(voice))
                     {
-                        Svc.Log.Debug($"[NPCVoiceMaster] No voice available for NPC '{npcName}'.");
+                        Svc.Log.Debug($"[NpcVoiceMaster] No voice available for '{npcName}'. Add voices to your default bucket.");
                         return;
                     }
 
-                    var audioBytes = await GenerateTtsAndDownloadAsync(text, voice);
-                    if (audioBytes == null || audioBytes.Length == 0)
+                    var audio = await GenerateTtsAndDownloadAsync(text, voice);
+                    if (audio == null || audio.Length == 0)
                     {
-                        Svc.Log.Debug($"[NPCVoiceMaster] TTS returned empty audio for '{npcName}'.");
+                        Svc.Log.Debug("[NpcVoiceMaster] AllTalk returned no audio.");
                         return;
                     }
 
-                    _player.PlayAudio(audioBytes);
+                    _player.PlayAudio(audio);
                 }
                 catch (Exception ex)
                 {
-                    Svc.Log.Error(ex, "[NPCVoiceMaster] Failed to generate/play TTS.");
+                    Svc.Log.Error(ex, "[NpcVoiceMaster] Failed to generate/play TTS.");
                 }
             });
         }
 
         private string ResolveVoiceForNpc(string npcName)
         {
-            // 1) Exact override
             var ov = Configuration.NpcExactVoiceOverrides.FirstOrDefault(x =>
                 x.Enabled &&
                 string.Equals(x.NpcKey, npcName, StringComparison.OrdinalIgnoreCase));
@@ -144,11 +189,9 @@ namespace NPCVoiceMaster
             if (ov != null && !string.IsNullOrWhiteSpace(ov.Voice))
                 return ov.Voice;
 
-            // 2) Already assigned
             if (Configuration.NpcAssignedVoices.TryGetValue(npcName, out var assigned) && !string.IsNullOrWhiteSpace(assigned))
                 return assigned;
 
-            // 3) Random from default bucket
             var bucket = Configuration.VoiceBuckets.FirstOrDefault(b =>
                 string.Equals(b.Name, Configuration.DefaultBucket, StringComparison.OrdinalIgnoreCase));
 
@@ -164,20 +207,17 @@ namespace NPCVoiceMaster
 
         private static string NormalizeBaseUrl(string url)
         {
-            url = url.Trim();
+            url = (url ?? "").Trim();
             while (url.EndsWith("/"))
                 url = url.Substring(0, url.Length - 1);
             return url;
         }
 
-        // AllTalk V2: GET /api/voices returns { status: "...", voices: ["..."] }
         public async Task<List<string>> FetchAllTalkVoicesAsync()
         {
-            var baseUrl = Configuration.AllTalkBaseUrl;
+            var baseUrl = NormalizeBaseUrl(Configuration.AllTalkBaseUrl);
             if (string.IsNullOrWhiteSpace(baseUrl))
                 return new List<string>();
-
-            baseUrl = NormalizeBaseUrl(baseUrl);
 
             try
             {
@@ -193,29 +233,25 @@ namespace NPCVoiceMaster
                         if (!string.IsNullOrWhiteSpace(s))
                             list.Add(s);
                     }
-                    return list;
+
+                    // De-dupe voices list case-insensitively
+                    return list.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 }
 
                 return new List<string>();
             }
             catch (Exception ex)
             {
-                Svc.Log.Warning(ex, "[NPCVoiceMaster] Failed to fetch voices from AllTalk.");
+                Svc.Log.Warning(ex, "[NpcVoiceMaster] Failed to fetch voices from AllTalk.");
                 return new List<string>();
             }
         }
 
-        // AllTalk V2: POST /api/tts-generate (form urlencoded), response contains output_cache_url
         private async Task<byte[]?> GenerateTtsAndDownloadAsync(string text, string voice)
         {
-            var baseUrl = Configuration.AllTalkBaseUrl;
+            var baseUrl = NormalizeBaseUrl(Configuration.AllTalkBaseUrl);
             if (string.IsNullOrWhiteSpace(baseUrl))
                 return null;
-
-            baseUrl = NormalizeBaseUrl(baseUrl);
-
-            // Create a stable-ish filename hint (AllTalk can still timestamp it)
-            var outputName = "npcvoicemaster";
 
             var form = new Dictionary<string, string>
             {
@@ -225,7 +261,7 @@ namespace NPCVoiceMaster
                 ["narrator_enabled"] = "false",
                 ["text_not_inside"] = "character",
                 ["language"] = "auto",
-                ["output_file_name"] = outputName,
+                ["output_file_name"] = "npcvoicemaster",
                 ["output_file_timestamp"] = "true",
                 ["autoplay"] = "false"
             };
@@ -243,7 +279,6 @@ namespace NPCVoiceMaster
             if (!string.Equals(status, "generate-success", StringComparison.OrdinalIgnoreCase))
                 return null;
 
-            // Prefer cache URL if present
             string? relUrl = null;
             if (doc.RootElement.TryGetProperty("output_cache_url", out var cacheEl))
                 relUrl = cacheEl.GetString();
@@ -254,9 +289,99 @@ namespace NPCVoiceMaster
             if (string.IsNullOrWhiteSpace(relUrl))
                 return null;
 
-            // Response does not include host, so we add it ourselves
-            var downloadUrl = $"{baseUrl}{relUrl}";
-            return await _httpClient.GetByteArrayAsync(downloadUrl);
+            return await _httpClient.GetByteArrayAsync($"{baseUrl}{relUrl}");
+        }
+
+        // =========================
+        //  Auto-bucket by filename
+        // =========================
+
+        public int AutoBucketVoicesFromNames(List<string> voiceNames, bool clearBucketsFirst)
+        {
+            if (voiceNames == null || voiceNames.Count == 0)
+                return 0;
+
+            if (Configuration.VoiceBuckets == null || Configuration.VoiceBuckets.Count == 0)
+                return 0;
+
+            // Optional: clear all existing bucket voice lists first
+            if (clearBucketsFirst)
+            {
+                foreach (var b in Configuration.VoiceBuckets)
+                    b.Voices.Clear();
+            }
+
+            // Ensure bucket voice lists are de-duped before we add more
+            foreach (var b in Configuration.VoiceBuckets)
+            {
+                b.Voices = b.Voices
+                    .Where(v => !string.IsNullOrWhiteSpace(v))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+
+            int added = 0;
+
+            foreach (var raw in voiceNames.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(raw))
+                    continue;
+
+                var bucket = InferBucketFromVoiceName(raw);
+                if (string.IsNullOrWhiteSpace(bucket))
+                    continue;
+
+                var b = Configuration.VoiceBuckets.FirstOrDefault(x =>
+                    string.Equals(x.Name, bucket, StringComparison.OrdinalIgnoreCase));
+
+                if (b == null)
+                    continue;
+
+                if (!b.Voices.Contains(raw, StringComparer.OrdinalIgnoreCase))
+                {
+                    b.Voices.Add(raw);
+                    added++;
+                }
+            }
+
+            Configuration.Save();
+            return added;
+        }
+
+        private string InferBucketFromVoiceName(string voiceName)
+        {
+            var n = Path.GetFileNameWithoutExtension(voiceName) ?? voiceName;
+            n = n.ToLowerInvariant();
+
+            // Tokenize the name
+            var tokens = TokenSplit.Split(n)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // We use WOMAN now.
+            // Also accept legacy "female" so you don't have to rename everything immediately.
+            if (tokens.Contains("woman") || tokens.Contains("female"))
+                return "woman";
+
+            if (tokens.Contains("male"))
+                return "male";
+
+            if (tokens.Contains("boy"))
+                return "boy";
+
+            if (tokens.Contains("girl"))
+                return "girl";
+
+            if (tokens.Contains("loporrit") || tokens.Contains("lopo"))
+                return "loporrit";
+
+            if (tokens.Contains("machine") || tokens.Contains("robot") || tokens.Contains("mech"))
+                return "machine";
+
+            if (tokens.Contains("monsters") || tokens.Contains("monster") || tokens.Contains("beast"))
+                return "monsters";
+
+            return "";
         }
     }
 }

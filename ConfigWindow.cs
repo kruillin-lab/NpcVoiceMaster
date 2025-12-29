@@ -5,7 +5,7 @@ using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
 
-// Force ImGui to be the Dalamud bindings version (no ambiguity)
+// IMPORTANT: alias must be up here, before the namespace
 using ImGui = Dalamud.Bindings.ImGui.ImGui;
 
 namespace NPCVoiceMaster
@@ -82,6 +82,13 @@ namespace NPCVoiceMaster
                 _plugin.Configuration.Save();
             }
 
+            var debug = _plugin.Configuration.DebugLogCandidateChat;
+            if (ImGui.Checkbox("Debug: Log candidate chat lines (spammy)", ref debug))
+            {
+                _plugin.Configuration.DebugLogCandidateChat = debug;
+                _plugin.Configuration.Save();
+            }
+
             ImGui.Separator();
 
             var buckets = _plugin.Configuration.VoiceBuckets;
@@ -131,6 +138,25 @@ namespace NPCVoiceMaster
         {
             var buckets = _plugin.Configuration.VoiceBuckets;
 
+            ImGui.Text("Auto bucket rules: rename voices like 'woman_Alice.wav', 'male_Arnold.wav', etc.");
+            ImGui.TextDisabled("Legacy 'female_' names also map to 'woman'.");
+
+            if (ImGui.Button("Auto-fill buckets from voice filenames (keep existing)"))
+            {
+                var added = _plugin.AutoBucketVoicesFromNames(_voices, clearBucketsFirst: false);
+                _status = $"Auto-fill complete. Added {added} voice(s) to buckets (kept existing).";
+            }
+
+            ImGui.SameLine();
+
+            if (ImGui.Button("Clear + Auto-fill buckets from voice filenames"))
+            {
+                var added = _plugin.AutoBucketVoicesFromNames(_voices, clearBucketsFirst: true);
+                _status = $"Clear + Auto-fill complete. Added {added} voice(s) to buckets.";
+            }
+
+            ImGui.Separator();
+
             if (ImGui.BeginCombo("Target Bucket", _bucketToAddVoice))
             {
                 foreach (var b in buckets)
@@ -164,7 +190,7 @@ namespace NPCVoiceMaster
                 if (b != null && _voiceToAddIndex >= 0 && _voiceToAddIndex < filtered.Count)
                 {
                     var v = filtered[_voiceToAddIndex];
-                    if (!b.Voices.Contains(v))
+                    if (!b.Voices.Contains(v, StringComparer.OrdinalIgnoreCase))
                     {
                         b.Voices.Add(v);
                         _plugin.Configuration.Save();
@@ -183,6 +209,7 @@ namespace NPCVoiceMaster
                     {
                         b.Voices.Clear();
                         _plugin.Configuration.Save();
+                        _status = $"Cleared voices in bucket: {b.Name}";
                     }
 
                     foreach (var v in b.Voices)
@@ -222,7 +249,7 @@ namespace NPCVoiceMaster
                 var v = filtered[_exactVoiceIndex];
 
                 if (exist != null) exist.Voice = v;
-                else list.Add(new NpcExactVoiceOverride { NpcKey = _exactNpcKey, Voice = v });
+                else list.Add(new NpcExactVoiceOverride { NpcKey = _exactNpcKey, Voice = v, Enabled = true });
 
                 _plugin.Configuration.Save();
                 _status = $"Override Saved: {_exactNpcKey} -> {v}";
