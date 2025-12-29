@@ -1,143 +1,85 @@
-﻿using NAudio.CoreAudioApi;
-using NAudio.Wave;
-using System;
+﻿using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using NAudio.Wave;
 
-// FIXED NAMESPACE: Matches Plugin.cs
 namespace NPCVoiceMaster
 {
-    public class VoicePlayer : IDisposable
+    public sealed class VoicePlayer : IDisposable
     {
-        private readonly object _lock = new();
-        private IWavePlayer? _outputDevice;
-        private WaveStream? _audioReader;
-        private MemoryStream? _audioStream;
+        private readonly SemaphoreSlim _playLock = new SemaphoreSlim(1, 1);
         private bool _disposed;
 
-        public Action<string>? Log { get; set; }
-
-        public void PlayAudio(byte[] audioData)
+        /// <summary>
+        /// Fire-and-forget convenience (not recommended for sequencing).
+        /// </summary>
+        public void PlayAudio(byte[] wavBytes)
         {
-            if (audioData == null || audioData.Length == 0)
-            {
-                Log?.Invoke("[VoicePlayer] PlayAudio: empty bytes.");
-                return;
-            }
+            _ = PlayAudioAsync(wavBytes, CancellationToken.None);
+        }
 
-            lock (_lock)
+        /// <summary>
+        /// Plays a WAV (byte[]) and completes when playback actually finishes.
+        /// This avoids guessing duration and prevents random 5–30s dead gaps.
+        /// </summary>
+        public async Task PlayAudioAsync(byte[] wavBytes, CancellationToken ct)
+        {
+            if (_disposed) return;
+            if (wavBytes == null || wavBytes.Length == 0) return;
+
+            await _playLock.WaitAsync(ct).ConfigureAwait(false);
+            try
             {
                 if (_disposed) return;
+
+                using var ms = new MemoryStream(wavBytes, writable: false);
+                using var reader = new WaveFileReader(ms);
+                using var output = new WaveOutEvent();
+
+                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                void OnStopped(object? s, StoppedEventArgs e)
+                {
+                    output.PlaybackStopped -= OnStopped;
+
+                    // If NAudio reports an error, surface it (but don't crash plugin)
+                    if (e.Exception != null)
+                        tcs.TrySetException(e.Exception);
+                    else
+                        tcs.TrySetResult(true);
+                }
+
+                output.PlaybackStopped += OnStopped;
+                output.Init(reader);
+
+                using var reg = ct.Register(() =>
+                {
+                    try { output.Stop(); } catch { /* ignore */ }
+                });
+
+                output.Play();
 
                 try
                 {
-                    StopInternal();
-                    LogDefaultDevice();
-
-                    _audioStream = new MemoryStream(audioData, writable: false);
-
-                    // Decode
-                    WaveStream decoded;
-                    if (LooksLikeWav(audioData))
-                    {
-                        decoded = new WaveFileReader(_audioStream);
-                        Log?.Invoke($"[VoicePlayer] WAV decoded OK. Duration={decoded.TotalTime}");
-                    }
-                    else
-                    {
-                        decoded = new Mp3FileReader(_audioStream);
-                        Log?.Invoke($"[VoicePlayer] MP3 decoded OK. Duration={decoded.TotalTime}");
-                    }
-
-                    _audioReader = new WaveChannel32(decoded) { Volume = 1.0f };
-
-                    var waveOut = new WaveOutEvent
-                    {
-                        DesiredLatency = 100
-                    };
-
-                    _outputDevice = waveOut;
-                    _outputDevice.PlaybackStopped += OnPlaybackStopped;
-                    _outputDevice.Init(_audioReader);
-                    _outputDevice.Play();
-
-                    Log?.Invoke("[VoicePlayer] Playback started (WaveOutEvent, volume=1.0).");
+                    await tcs.Task.ConfigureAwait(false);
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Log?.Invoke($"[VoicePlayer] PlayAudio ERROR: {ex.GetType().Name}: {ex.Message}");
-                    StopInternal();
+                    // Swallow exceptions so one bad WAV doesn't kill the whole queue
+                    // (the plugin will just skip/continue)
                 }
             }
-        }
-
-        private static bool LooksLikeWav(byte[] bytes)
-        {
-            if (bytes.Length < 12) return false;
-            return bytes[0] == (byte)'R' && bytes[1] == (byte)'I' && bytes[2] == (byte)'F' && bytes[3] == (byte)'F'
-                && bytes[8] == (byte)'W' && bytes[9] == (byte)'A' && bytes[10] == (byte)'V' && bytes[11] == (byte)'E';
-        }
-
-        public void Stop()
-        {
-            lock (_lock)
+            finally
             {
-                if (_disposed) return;
-                StopInternal();
-            }
-        }
-
-        private void StopInternal()
-        {
-            try { _outputDevice?.Stop(); } catch { }
-
-            try { _audioReader?.Dispose(); } catch { }
-            _audioReader = null;
-
-            try { _audioStream?.Dispose(); } catch { }
-            _audioStream = null;
-
-            if (_outputDevice != null)
-            {
-                try { _outputDevice.PlaybackStopped -= OnPlaybackStopped; } catch { }
-                try { _outputDevice.Dispose(); } catch { }
-                _outputDevice = null;
-            }
-        }
-
-        private void OnPlaybackStopped(object? sender, StoppedEventArgs e)
-        {
-            lock (_lock)
-            {
-                if (_disposed) return;
-                if (e.Exception != null)
-                    Log?.Invoke($"[VoicePlayer] PlaybackStopped exception: {e.Exception.GetType().Name}: {e.Exception.Message}");
-                StopInternal();
-            }
-        }
-
-        private void LogDefaultDevice()
-        {
-            try
-            {
-                using var enumerator = new MMDeviceEnumerator();
-                var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                Log?.Invoke($"[VoicePlayer] Default output device: {device.FriendlyName}");
-                Log?.Invoke($"[VoicePlayer] Device state: {device.State}");
-            }
-            catch (Exception ex)
-            {
-                Log?.Invoke($"[VoicePlayer] Default device query failed: {ex.GetType().Name}: {ex.Message}");
+                _playLock.Release();
             }
         }
 
         public void Dispose()
         {
-            lock (_lock)
-            {
-                if (_disposed) return;
-                _disposed = true;
-                StopInternal();
-            }
+            _disposed = true;
+            _playLock.Dispose();
         }
     }
 }

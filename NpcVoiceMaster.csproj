@@ -1,67 +1,95 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <Authors>YourName</Authors>
-    <Version>1.0.0.0</Version>
-    <Description>NPC Voice Master Plugin</Description>
+	<PropertyGroup>
+		<Authors>YourName</Authors>
+		<Version>1.0.0.0</Version>
+		<Description>NPC Voice Master Plugin</Description>
 
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <Platforms>x64</Platforms>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<Platforms>x64</Platforms>
 
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
 
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
 
-    <!-- This is where your dev plugin lives -->
-    <DalamudDevPluginDir>$(UserProfile)\AppData\Roaming\XIVLauncher\devPlugins\NpcVoiceMaster</DalamudDevPluginDir>
-  </PropertyGroup>
+		<!-- This is where your dev plugin lives -->
+		<DalamudDevPluginDir>$(UserProfile)\AppData\Roaming\XIVLauncher\devPlugins\NpcVoiceMaster</DalamudDevPluginDir>
 
-  <ItemGroup>
-    <Reference Include="Dalamud">
-      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+		<!-- Local Dalamud dev DLL folder -->
+		<DalamudDevDllDir>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev</DalamudDevDllDir>
+	</PropertyGroup>
 
-    <Reference Include="Dalamud.Bindings.ImGui">
-      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Bindings.ImGui.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+	<ItemGroup>
+		<Reference Include="Dalamud">
+			<HintPath>$(DalamudDevDllDir)\Dalamud.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-    <Reference Include="Dalamud.Interface">
-      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Interface.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+		<Reference Include="Dalamud.Bindings.ImGui">
+			<HintPath>$(DalamudDevDllDir)\Dalamud.Bindings.ImGui.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-    <Reference Include="Lumina">
-      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+		<Reference Include="Dalamud.Interface">
+			<HintPath>$(DalamudDevDllDir)\Dalamud.Interface.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-    <Reference Include="Lumina.Excel">
-      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.Excel.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
+		<Reference Include="Lumina">
+			<HintPath>$(DalamudDevDllDir)\Lumina.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-  <ItemGroup>
-    <PackageReference Include="NAudio" Version="2.2.1" />
-    <PackageReference Include="DalamudPackager" Version="2.1.13" />
-  </ItemGroup>
+		<Reference Include="Lumina.Excel">
+			<HintPath>$(DalamudDevDllDir)\Lumina.Excel.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-  <!-- Copy output to devPlugins after build -->
-  <Target Name="CopyToDalamudDevPlugins" AfterTargets="Build">
-    <Message Importance="High" Text="Copying build output to $(DalamudDevPluginDir)..." />
-    <MakeDir Directories="$(DalamudDevPluginDir)" />
+		<!-- ✅ LOCAL reference for FFXIVClientStructs (no NuGet feed) -->
+		<Reference Include="FFXIVClientStructs" Condition="Exists('$(DalamudDevDllDir)\FFXIVClientStructs.dll')">
+			<HintPath>$(DalamudDevDllDir)\FFXIVClientStructs.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-    <!-- Copy DLL + PDB -->
-    <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(DalamudDevPluginDir)" OverwriteReadOnlyFiles="true" />
-    <Copy SourceFiles="$(TargetDir)$(AssemblyName).pdb" DestinationFolder="$(DalamudDevPluginDir)" Condition="Exists('$(TargetDir)$(AssemblyName).pdb')" OverwriteReadOnlyFiles="true" />
+		<!-- Alternate name some setups use -->
+		<Reference Include="FFXIVClientStructs" Condition="Exists('$(DalamudDevDllDir)\FFXIVClientStructs.FFXIVClientStructs.dll')">
+			<HintPath>$(DalamudDevDllDir)\FFXIVClientStructs.FFXIVClientStructs.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 
-    <!-- Copy the manifest (same name as your project JSON) if it exists in project dir -->
-    <Copy SourceFiles="$(ProjectDir)NpcVoiceMaster.json" DestinationFolder="$(DalamudDevPluginDir)" Condition="Exists('$(ProjectDir)NpcVoiceMaster.json')" OverwriteReadOnlyFiles="true" />
-  </Target>
+		<!-- ✅ REQUIRED by FFXIVClientStructs: InteropGenerator runtime -->
+		<Reference Include="InteropGenerator.Runtime" Condition="Exists('$(DalamudDevDllDir)\InteropGenerator.Runtime.dll')">
+			<HintPath>$(DalamudDevDllDir)\InteropGenerator.Runtime.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+
+		<!-- Alternate locations/names that sometimes show up -->
+		<Reference Include="InteropGenerator.Runtime" Condition="Exists('$(DalamudDevDllDir)\InteropGenerator.Runtime\InteropGenerator.Runtime.dll')">
+			<HintPath>$(DalamudDevDllDir)\InteropGenerator.Runtime\InteropGenerator.Runtime.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+
+		<Reference Include="InteropGenerator.Runtime" Condition="Exists('$(DalamudDevDllDir)\InteropGenerator.Runtime\lib\netstandard2.0\InteropGenerator.Runtime.dll')">
+			<HintPath>$(DalamudDevDllDir)\InteropGenerator.Runtime\lib\netstandard2.0\InteropGenerator.Runtime.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="NAudio" Version="2.2.1" />
+		<PackageReference Include="DalamudPackager" Version="2.1.13" />
+	</ItemGroup>
+
+	<Target Name="CopyToDalamudDevPlugins" AfterTargets="Build">
+		<Message Importance="High" Text="Copying build output to $(DalamudDevPluginDir)..." />
+		<MakeDir Directories="$(DalamudDevPluginDir)" />
+
+		<Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(DalamudDevPluginDir)" OverwriteReadOnlyFiles="true" />
+		<Copy SourceFiles="$(TargetDir)$(AssemblyName).pdb" DestinationFolder="$(DalamudDevPluginDir)" Condition="Exists('$(TargetDir)$(AssemblyName).pdb')" OverwriteReadOnlyFiles="true" />
+		<Copy SourceFiles="$(ProjectDir)NpcVoiceMaster.json" DestinationFolder="$(DalamudDevPluginDir)" Condition="Exists('$(ProjectDir)NpcVoiceMaster.json')" OverwriteReadOnlyFiles="true" />
+	</Target>
 
 </Project>

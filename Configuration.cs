@@ -9,151 +9,156 @@ namespace NPCVoiceMaster
     [Serializable]
     public class Configuration : IPluginConfiguration
     {
-        public int Version { get; set; } = 0;
+        public int Version { get; set; } = 3;
 
         public bool Enabled { get; set; } = true;
 
+        // Debug overlay toggle
+        public bool DebugOverlayEnabled { get; set; } = false;
+
+        // AllTalk
         public string AllTalkBaseUrl { get; set; } = "http://10.0.0.80:7851";
 
+        // Optional override for cache root folder. If blank, plugin uses <PluginConfigDir>\cache
+        public string CacheFolderOverride { get; set; } = "";
+
+        // Default bucket for random assignment
         public string DefaultBucket { get; set; } = "male";
 
-        // If true, logs lots of chat messages with their numeric type
-        public bool DebugLogCandidateChat { get; set; } = false;
+        // Sticky NPC -> chosen voice (random assignment gets stored here)
+        public Dictionary<string, string> NpcAssignedVoices { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-        public Dictionary<string, string> NpcAssignedVoices { get; set; } = new();
-
+        // Bucket definitions
         public List<VoiceBucket> VoiceBuckets { get; set; } = new();
 
+        // Exact per-NPC voice overrides (beats everything)
         public List<NpcExactVoiceOverride> NpcExactVoiceOverrides { get; set; } = new();
 
+        // NPC -> bucket override (used if no exact voice override)
+        public Dictionary<string, string> NpcBucketOverrides { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         [NonSerialized]
-        private IDalamudPluginInterface? _pluginInterface;
+        private IDalamudPluginInterface? _pi;
 
         public void Initialize(IDalamudPluginInterface pluginInterface)
         {
-            _pluginInterface = pluginInterface;
+            _pi = pluginInterface;
 
-            // Always clean/migrate buckets on load so old configs don't create duplicates forever.
-            MigrateAndCleanBuckets();
+            VoiceBuckets ??= new List<VoiceBucket>();
+            NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            NpcExactVoiceOverrides ??= new List<NpcExactVoiceOverride>();
+            NpcBucketOverrides ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            MigrateAndClean();
         }
 
         public void Save()
         {
-            _pluginInterface!.SavePluginConfig(this);
+            _pi!.SavePluginConfig(this);
         }
 
-        private void MigrateAndCleanBuckets()
+        private void MigrateAndClean()
         {
-            // Expected buckets (canonical names, in the order we want to show them)
-            var canonicalOrder = new List<string>
-            {
-                "male",
-                "woman",
-                "boy",
-                "girl",
-                "loporrit",
-                "machine",
-                "monsters",
-            };
+            // Ensure canonical buckets exist and migrate "female" -> "woman"
+            var canonical = new List<string> { "male", "woman", "boy", "girl", "loporrit", "machine", "monsters" };
 
-            // If config has never been created or got nuked, start sane.
-            if (VoiceBuckets == null)
-                VoiceBuckets = new List<VoiceBucket>();
-
-            // 1) Normalize names and migrate female -> woman
             foreach (var b in VoiceBuckets)
             {
-                if (b == null) continue;
-
                 b.Name = (b.Name ?? "").Trim();
                 if (b.Name.Equals("female", StringComparison.OrdinalIgnoreCase))
                     b.Name = "woman";
 
-                if (b.Voices == null)
-                    b.Voices = new List<string>();
+                b.Voices ??= new List<string>();
+                b.Voices = b.Voices
+                    .Where(v => !string.IsNullOrWhiteSpace(v))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
             }
 
-            // 2) Merge duplicates by name (case-insensitive)
             var merged = new Dictionary<string, VoiceBucket>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var b in VoiceBuckets.Where(x => x != null))
+            foreach (var b in VoiceBuckets)
             {
-                var name = (b.Name ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(name))
-                    continue;
+                if (string.IsNullOrWhiteSpace(b.Name)) continue;
 
-                if (!merged.TryGetValue(name, out var existing))
+                if (!merged.TryGetValue(b.Name, out var existing))
                 {
-                    merged[name] = new VoiceBucket
-                    {
-                        Name = name,
-                        Voices = new List<string>()
-                    };
-                    existing = merged[name];
+                    existing = new VoiceBucket { Name = b.Name, Voices = new List<string>() };
+                    merged[b.Name] = existing;
                 }
 
-                // Merge voices (case-insensitive de-dupe)
-                foreach (var v in b.Voices.Where(v => !string.IsNullOrWhiteSpace(v)))
+                foreach (var v in b.Voices)
                 {
                     if (!existing.Voices.Contains(v, StringComparer.OrdinalIgnoreCase))
                         existing.Voices.Add(v);
                 }
             }
 
-            // 3) Ensure all canonical buckets exist
-            foreach (var name in canonicalOrder)
+            foreach (var name in canonical)
             {
                 if (!merged.ContainsKey(name))
-                {
-                    merged[name] = new VoiceBucket
-                    {
-                        Name = name,
-                        Voices = new List<string>()
-                    };
-                }
+                    merged[name] = new VoiceBucket { Name = name, Voices = new List<string>() };
             }
 
-            // 4) Rebuild the list in canonical order, then append any extra custom buckets at the end
             var rebuilt = new List<VoiceBucket>();
-
-            foreach (var name in canonicalOrder)
+            foreach (var name in canonical)
             {
                 var b = merged[name];
-                b.Name = name; // enforce canonical casing
+                b.Name = name;
                 b.Voices = b.Voices
                     .Where(v => !string.IsNullOrWhiteSpace(v))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
                     .ToList();
-
                 rebuilt.Add(b);
             }
 
-            // Extra buckets (user-added custom categories) keep them, but not duplicated
-            var extras = merged.Keys
-                .Where(k => !canonicalOrder.Contains(k, StringComparer.OrdinalIgnoreCase))
+            var custom = merged.Keys
+                .Where(k => !canonical.Contains(k, StringComparer.OrdinalIgnoreCase))
                 .OrderBy(k => k, StringComparer.OrdinalIgnoreCase);
 
-            foreach (var extraName in extras)
+            foreach (var name in custom)
             {
-                var b = merged[extraName];
-                b.Name = extraName.Trim();
+                var b = merged[name];
                 b.Voices = b.Voices
                     .Where(v => !string.IsNullOrWhiteSpace(v))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
                     .ToList();
                 rebuilt.Add(b);
             }
 
             VoiceBuckets = rebuilt;
 
-            // 5) If DefaultBucket points to something that no longer exists, set it to male
             if (string.IsNullOrWhiteSpace(DefaultBucket) ||
                 !VoiceBuckets.Any(b => b.Name.Equals(DefaultBucket, StringComparison.OrdinalIgnoreCase)))
             {
                 DefaultBucket = "male";
             }
 
-            // 6) Save after migration so duplicates don’t come back next reload
+            var cleaned = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in NpcBucketOverrides)
+            {
+                var k = (kv.Key ?? "").Trim();
+                var v = (kv.Value ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(k) || string.IsNullOrWhiteSpace(v))
+                    continue;
+                cleaned[k] = v;
+            }
+            NpcBucketOverrides = cleaned;
+
+            foreach (var o in NpcExactVoiceOverrides)
+            {
+                o.NpcKey = (o.NpcKey ?? "").Trim();
+                o.Voice = (o.Voice ?? "").Trim();
+            }
+
+            NpcExactVoiceOverrides = NpcExactVoiceOverrides
+                .Where(o => !string.IsNullOrWhiteSpace(o.NpcKey))
+                .GroupBy(o => o.NpcKey, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+
             Save();
         }
     }
