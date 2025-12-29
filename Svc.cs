@@ -1,8 +1,7 @@
-﻿using Dalamud.Game.Gui;
-using Dalamud.IoC;
+﻿using Dalamud.IoC;
 using Dalamud.Plugin.Services;
 
-namespace NpcVoiceMaster;
+namespace NPCVoiceMaster;
 
 public static class Svc
 {

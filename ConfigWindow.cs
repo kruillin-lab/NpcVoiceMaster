@@ -1,5 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
-using Dalamud.Interface.Windowing;
+﻿using Dalamud.Interface.Windowing;
 using ImGuiNET;
 using System;
 using System.Collections.Generic;
@@ -9,7 +8,6 @@ using System.Threading.Tasks;
 
 namespace NPCVoiceMaster
 {
-    // FIX 2: Added IDisposable interface so Plugin.cs can call Dispose()
     public class ConfigWindow : Window, IDisposable
     {
         private readonly Plugin _plugin;
@@ -31,11 +29,9 @@ namespace NPCVoiceMaster
             _ = RefreshVoicesAsync();
         }
 
-        // FIX 2: The missing Dispose method
         public void Dispose()
         {
-            // If you have textures or heavy resources to clean up, do it here.
-            // Otherwise, this empty method satisfies the compiler.
+            // nothing to dispose right now
         }
 
         public override void Draw()
@@ -65,6 +61,7 @@ namespace NPCVoiceMaster
                     DrawOverridesTab();
                     ImGui.EndTabItem();
                 }
+
                 ImGui.EndTabBar();
             }
         }
@@ -91,20 +88,25 @@ namespace NPCVoiceMaster
             {
                 foreach (var b in buckets)
                 {
-                    if (ImGui.Selectable(b.Name, b.Name == _bucketToAddVoice)) _bucketToAddVoice = b.Name;
+                    if (ImGui.Selectable(b.Name, b.Name == _bucketToAddVoice))
+                        _bucketToAddVoice = b.Name;
                 }
                 ImGui.EndCombo();
             }
 
-            var filtered = _voices.Where(v => v.Contains(_voiceFilter, StringComparison.OrdinalIgnoreCase)).ToList();
             ImGui.InputText("Filter Voices", ref _voiceFilter, 100);
+            var filtered = _voices.Where(v => v.Contains(_voiceFilter, StringComparison.OrdinalIgnoreCase)).ToList();
 
-            var preview = (filtered.Count > 0 && _voiceToAddIndex >= 0 && _voiceToAddIndex < filtered.Count) ? filtered[_voiceToAddIndex] : "Select Voice...";
+            var preview = (filtered.Count > 0 && _voiceToAddIndex >= 0 && _voiceToAddIndex < filtered.Count)
+                ? filtered[_voiceToAddIndex]
+                : "Select Voice...";
+
             if (ImGui.BeginCombo("##voiceSelector", preview))
             {
                 for (int i = 0; i < filtered.Count; i++)
                 {
-                    if (ImGui.Selectable(filtered[i], i == _voiceToAddIndex)) _voiceToAddIndex = i;
+                    if (ImGui.Selectable(filtered[i], i == _voiceToAddIndex))
+                        _voiceToAddIndex = i;
                 }
                 ImGui.EndCombo();
             }
@@ -147,14 +149,18 @@ namespace NPCVoiceMaster
             ImGui.Text("Force a specific voice for an NPC:");
             ImGui.InputText("NPC Name (Exact)", ref _exactNpcKey, 100);
 
+            // Use same filter UI
             var filtered = _voices.Where(v => v.Contains(_voiceFilter, StringComparison.OrdinalIgnoreCase)).ToList();
-            var preview = (filtered.Count > 0 && _exactVoiceIndex >= 0 && _exactVoiceIndex < filtered.Count) ? filtered[_exactVoiceIndex] : "Select Voice...";
+            var preview = (filtered.Count > 0 && _exactVoiceIndex >= 0 && _exactVoiceIndex < filtered.Count)
+                ? filtered[_exactVoiceIndex]
+                : "Select Voice...";
 
             if (ImGui.BeginCombo("##overrideSelector", preview))
             {
                 for (int i = 0; i < filtered.Count; i++)
                 {
-                    if (ImGui.Selectable(filtered[i], i == _exactVoiceIndex)) _exactVoiceIndex = i;
+                    if (ImGui.Selectable(filtered[i], i == _exactVoiceIndex))
+                        _exactVoiceIndex = i;
                 }
                 ImGui.EndCombo();
             }
@@ -184,7 +190,10 @@ namespace NPCVoiceMaster
                 var v = await _plugin.FetchAllTalkVoicesAsync();
                 _voices = v ?? new List<string>();
             }
-            finally { _loadingVoices = false; }
+            finally
+            {
+                _loadingVoices = false;
+            }
         }
     }
 }
