@@ -1,10 +1,12 @@
 ﻿using Dalamud.Interface.Windowing;
-using ImGuiNET;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
+
+// Force ImGui to be the Dalamud bindings version (no ambiguity)
+using ImGui = Dalamud.Bindings.ImGui.ImGui;
 
 namespace NPCVoiceMaster
 {
@@ -24,14 +26,13 @@ namespace NPCVoiceMaster
 
         public ConfigWindow(Plugin plugin) : base("NPC Voice Master")
         {
-            this.SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(600, 500) };
-            this._plugin = plugin;
+            SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(650, 520) };
+            _plugin = plugin;
             _ = RefreshVoicesAsync();
         }
 
         public void Dispose()
         {
-            // nothing to dispose right now
         }
 
         public override void Draw()
@@ -44,6 +45,12 @@ namespace NPCVoiceMaster
 
             if (ImGui.BeginTabBar("Tabs"))
             {
+                if (ImGui.BeginTabItem("General"))
+                {
+                    DrawGeneralTab();
+                    ImGui.EndTabItem();
+                }
+
                 if (ImGui.BeginTabItem("Connection"))
                 {
                     DrawConnectionTab();
@@ -66,6 +73,46 @@ namespace NPCVoiceMaster
             }
         }
 
+        private void DrawGeneralTab()
+        {
+            var enabled = _plugin.Configuration.Enabled;
+            if (ImGui.Checkbox("Enable NPC Voice Master", ref enabled))
+            {
+                _plugin.Configuration.Enabled = enabled;
+                _plugin.Configuration.Save();
+            }
+
+            ImGui.Separator();
+
+            var buckets = _plugin.Configuration.VoiceBuckets;
+            var defaultBucket = _plugin.Configuration.DefaultBucket;
+
+            if (string.IsNullOrWhiteSpace(defaultBucket) && buckets.Count > 0)
+                defaultBucket = buckets[0].Name;
+
+            if (ImGui.BeginCombo("Default Bucket", defaultBucket))
+            {
+                foreach (var b in buckets)
+                {
+                    if (ImGui.Selectable(b.Name, b.Name == defaultBucket))
+                    {
+                        _plugin.Configuration.DefaultBucket = b.Name;
+                        _plugin.Configuration.Save();
+                    }
+                }
+                ImGui.EndCombo();
+            }
+
+            ImGui.Spacing();
+            ImGui.TextDisabled($"Assigned NPC voices saved: {_plugin.Configuration.NpcAssignedVoices.Count}");
+            if (ImGui.Button("Clear ALL assigned NPC voices (keeps Overrides)"))
+            {
+                _plugin.Configuration.NpcAssignedVoices.Clear();
+                _plugin.Configuration.Save();
+                _status = "Cleared assigned NPC voices.";
+            }
+        }
+
         private void DrawConnectionTab()
         {
             var url = _plugin.Configuration.AllTalkBaseUrl ?? "";
@@ -77,7 +124,7 @@ namespace NPCVoiceMaster
 
             if (ImGui.Button("Refresh Voices")) _ = RefreshVoicesAsync();
             ImGui.SameLine();
-            ImGui.TextDisabled($"Loaded: {_voices.Count}");
+            ImGui.TextDisabled(_loadingVoices ? "Loading..." : $"Loaded: {_voices.Count}");
         }
 
         private void DrawBucketsTab()
@@ -149,8 +196,9 @@ namespace NPCVoiceMaster
             ImGui.Text("Force a specific voice for an NPC:");
             ImGui.InputText("NPC Name (Exact)", ref _exactNpcKey, 100);
 
-            // Use same filter UI
+            ImGui.InputText("Filter Voices", ref _voiceFilter, 100);
             var filtered = _voices.Where(v => v.Contains(_voiceFilter, StringComparison.OrdinalIgnoreCase)).ToList();
+
             var preview = (filtered.Count > 0 && _exactVoiceIndex >= 0 && _exactVoiceIndex < filtered.Count)
                 ? filtered[_exactVoiceIndex]
                 : "Select Voice...";
@@ -170,7 +218,7 @@ namespace NPCVoiceMaster
                 if (string.IsNullOrWhiteSpace(_exactNpcKey) || _exactVoiceIndex < 0) return;
 
                 var list = _plugin.Configuration.NpcExactVoiceOverrides;
-                var exist = list.FirstOrDefault(x => x.NpcKey == _exactNpcKey);
+                var exist = list.FirstOrDefault(x => x.NpcKey.Equals(_exactNpcKey, StringComparison.OrdinalIgnoreCase));
                 var v = filtered[_exactVoiceIndex];
 
                 if (exist != null) exist.Voice = v;
@@ -179,6 +227,9 @@ namespace NPCVoiceMaster
                 _plugin.Configuration.Save();
                 _status = $"Override Saved: {_exactNpcKey} -> {v}";
             }
+
+            ImGui.Separator();
+            ImGui.TextDisabled($"Overrides: {_plugin.Configuration.NpcExactVoiceOverrides.Count}");
         }
 
         private async Task RefreshVoicesAsync()

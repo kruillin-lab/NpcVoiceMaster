@@ -1,46 +1,51 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
-	<PropertyGroup>
-		<Authors>YourName</Authors>
-		<Version>1.0.0.0</Version>
-		<Description>NPC Voice Master Plugin</Description>
-		<TargetFramework>net10.0-windows</TargetFramework>
-		<Platforms>x64</Platforms>
-		<Nullable>enable</Nullable>
-		<LangVersion>latest</LangVersion>
-		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-	</PropertyGroup>
+  <PropertyGroup>
+    <Authors>YourName</Authors>
+    <Version>1.0.0.0</Version>
+    <Description>NPC Voice Master Plugin</Description>
 
-	<ItemGroup>
-		<Reference Include="Dalamud">
-			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.dll</HintPath>
-			<Private>false</Private>
-		</Reference>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>x64</Platforms>
 
-		<!-- IMPORTANT: needed for Windowing/UI helpers -->
-		<Reference Include="Dalamud.Interface">
-			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Interface.dll</HintPath>
-			<Private>false</Private>
-		</Reference>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
 
-		<Reference Include="Lumina">
-			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.dll</HintPath>
-			<Private>false</Private>
-		</Reference>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
 
-		<Reference Include="Lumina.Excel">
-			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.Excel.dll</HintPath>
-			<Private>false</Private>
-		</Reference>
-	</ItemGroup>
+  <ItemGroup>
+    <Reference Include="Dalamud">
+      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
 
-	<ItemGroup>
-		<!-- ImGuiNET provides ImGui, ImGuiTabBarFlags, etc. -->
-		<PackageReference Include="ImGui.NET" Version="1.90.0.1" />
-		<PackageReference Include="NAudio" Version="2.2.1" />
-		<PackageReference Include="DalamudPackager" Version="2.1.13" />
-	</ItemGroup>
+    <Reference Include="Dalamud.Bindings.ImGui">
+      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Bindings.ImGui.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="Dalamud.Interface">
+      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Interface.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="Lumina">
+      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="Lumina.Excel">
+      <HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.Excel.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="DalamudPackager" Version="2.1.13" />
+  </ItemGroup>
 
 </Project>
