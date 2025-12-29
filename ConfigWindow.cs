@@ -187,15 +187,15 @@ namespace NPCVoiceMaster
             ImGui.SameLine();
             if (ImGui.Button("Auto-bucket fetched voices (clear first)"))
             {
-                var count = _plugin.AutoBucketVoicesFromNames(_fetchedVoices, clearBucketsFirst: true);
-                _status = $"Auto-bucketed {count} voices.";
+                _plugin.AutoBucketVoicesFromNames(_fetchedVoices, clearBucketsFirst: true);
+                _status = _fetchedVoices.Count == 0 ? "Auto-bucket complete (no fetched voices)." : $"Auto-bucketed {_fetchedVoices.Count} fetched voices (cleared first).";
             }
 
             ImGui.SameLine();
             if (ImGui.Button("Auto-bucket fetched voices (merge)"))
             {
-                var count = _plugin.AutoBucketVoicesFromNames(_fetchedVoices, clearBucketsFirst: false);
-                _status = $"Added {count} voices.";
+                _plugin.AutoBucketVoicesFromNames(_fetchedVoices, clearBucketsFirst: false);
+                _status = _fetchedVoices.Count == 0 ? "Auto-bucket merge complete (no fetched voices)." : $"Merged {_fetchedVoices.Count} fetched voices into buckets.";
             }
 
             ImGui.Spacing();
