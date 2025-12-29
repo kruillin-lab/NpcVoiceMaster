@@ -1,10 +1,10 @@
-﻿// File: VoicePlayer.cs
-using NAudio.CoreAudioApi;
+﻿using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using System;
 using System.IO;
 
-namespace NpcVoiceMaster
+// FIXED NAMESPACE: Matches Plugin.cs
+namespace NPCVoiceMaster
 {
     public class VoicePlayer : IDisposable
     {
@@ -48,12 +48,8 @@ namespace NpcVoiceMaster
                         Log?.Invoke($"[VoicePlayer] MP3 decoded OK. Duration={decoded.TotalTime}");
                     }
 
-                    // Force volume = 1.0 (100%) using a volume wrapper.
-                    // This makes "I didn't hear anything" much less likely to be a plugin volume issue.
                     _audioReader = new WaveChannel32(decoded) { Volume = 1.0f };
 
-                    // Output: WaveOutEvent is the most compatible path on Windows.
-                    // (WasapiOut can get "clever" with routing/exclusive mode and make you think nothing happened.)
                     var waveOut = new WaveOutEvent
                     {
                         DesiredLatency = 100
@@ -113,10 +109,8 @@ namespace NpcVoiceMaster
             lock (_lock)
             {
                 if (_disposed) return;
-
                 if (e.Exception != null)
                     Log?.Invoke($"[VoicePlayer] PlaybackStopped exception: {e.Exception.GetType().Name}: {e.Exception.Message}");
-
                 StopInternal();
             }
         }

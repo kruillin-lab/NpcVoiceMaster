@@ -1,46 +1,45 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<TargetFramework>net8.0-windows</TargetFramework>
-		<Platforms>x64;AnyCPU</Platforms>
+		<Authors>YourName</Authors>
+		<Version>1.0.0.0</Version>
+		<Description>NPC Voice Master Plugin</Description>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<Platforms>x64</Platforms>
 		<Nullable>enable</Nullable>
-		<ImplicitUsings>enable</ImplicitUsings>
 		<LangVersion>latest</LangVersion>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-
-		<BaseOutputPath>bin\</BaseOutputPath>
-		<OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
-
-		<AssemblyName>NpcVoiceMaster</AssemblyName>
-		<RootNamespace>NpcVoiceMaster</RootNamespace>
-
-		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-		<DalamudApiLevel>10</DalamudApiLevel>
+		<ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
 	</PropertyGroup>
 
 	<ItemGroup>
 		<Reference Include="Dalamud">
-			<HintPath>$(AppData)\XIVLauncher\addon\Hooks\dev\Dalamud.dll</HintPath>
+			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
-		<Reference Include="ImGui.NET">
-			<HintPath>$(AppData)\XIVLauncher\addon\Hooks\dev\ImGui.NET.dll</HintPath>
+
+		<Reference Include="Lumina">
+			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
-		<Reference Include="Dalamud.Interface">
-			<HintPath>$(AppData)\XIVLauncher\addon\Hooks\dev\Dalamud.Interface.dll</HintPath>
+
+		<Reference Include="Lumina.Excel">
+			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Lumina.Excel.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+
+		<Reference Include="Dalamud.Bindings.ImGui">
+			<HintPath>$(UserProfile)\AppData\Roaming\XIVLauncher\addon\Hooks\dev\Dalamud.Bindings.ImGui.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
 	</ItemGroup>
 
 	<ItemGroup>
+		<PackageReference Include="ImGui.NET" Version="1.90.0.1" />
+
 		<PackageReference Include="NAudio" Version="2.2.1" />
-	</ItemGroup>
-
-	<ItemGroup>
-		<None Include="NpcVoiceMaster.json">
-			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
-		</None>
+		<PackageReference Include="DalamudPackager" Version="2.1.13" />
 	</ItemGroup>
 
 </Project>
