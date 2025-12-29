@@ -23,27 +23,22 @@ namespace NpcVoiceMaster
         // Legacy (kept so you don't lose settings)
         public string AllTalkTtsPathOverride { get; set; } = "";
         public string AllTalkVoiceName { get; set; } = "Aerith_original.wav";
-        public string AllTalkLanguage { get; set; } = "English";
+
+        // IMPORTANT:
+        // AllTalk accepts ONLY these: auto, ar, zh-cn, zh, cs, nl, en, fr, de, hu, hi, it, ja, ko, pl, pt, ru, es, tr
+        // We normalize any user/saved values (e.g. "English", "en-US") into a valid code.
+        public string AllTalkLanguage { get; set; } = "en";
 
         // --- NEW: Buckets + mapping ---
         public List<VoiceBucket> VoiceBuckets { get; set; } = new();
 
-        // Keyword-based auto bucket rules:
-        // If npcKey contains Keyword (case-insensitive), bucket = BucketName.
-        // First match wins.
+        // Keyword-based auto bucket rules (first match wins)
         public List<BucketKeywordRule> BucketKeywordRules { get; set; } = new();
 
         // Manual override tables
-        // 1) Contains-style manual voice override (first match wins)
         public List<NpcContainsVoiceRule> NpcContainsVoiceRules { get; set; } = new();
-
-        // 2) Exact NPC -> forced bucket
         public List<NpcExactBucketOverride> NpcExactBucketOverrides { get; set; } = new();
-
-        // 3) Exact NPC -> forced voice
         public List<NpcExactVoiceOverride> NpcExactVoiceOverrides { get; set; } = new();
-
-        // 4) Persisted auto assignments: Exact NPC -> assigned voice (picked once, reused)
         public List<NpcAssignedVoice> NpcAssignedVoices { get; set; } = new();
 
         [NonSerialized] private IDalamudPluginInterface? _pluginInterface;
@@ -61,7 +56,10 @@ namespace NpcVoiceMaster
             CacheFolderOverride ??= "";
             AllTalkTtsPathOverride ??= "";
             AllTalkVoiceName ??= "Aerith_original.wav";
-            AllTalkLanguage ??= "English";
+            AllTalkLanguage ??= "en";
+
+            // Normalize language every load so old saved values like "English" stop breaking AllTalk.
+            AllTalkLanguage = NormalizeAllTalkLanguage(AllTalkLanguage);
 
             VoiceBuckets ??= new List<VoiceBucket>();
             BucketKeywordRules ??= new List<BucketKeywordRule>();
@@ -82,7 +80,7 @@ namespace NpcVoiceMaster
                 VoiceBuckets.Add(new VoiceBucket { Name = "monster" });
             }
 
-            // Seed keyword rules if missing (you can edit in UI)
+            // Seed keyword rules if missing (editable in UI)
             if (BucketKeywordRules.Count == 0)
             {
                 BucketKeywordRules.Add(new BucketKeywordRule { Keyword = "loporrit", BucketName = "loporrit" });
@@ -123,48 +121,107 @@ namespace NpcVoiceMaster
         {
             _pluginInterface?.SavePluginConfig(this);
         }
+
+        private static string NormalizeAllTalkLanguage(string? raw)
+        {
+            var s = (raw ?? "").Trim().ToLowerInvariant();
+
+            // Allowed by AllTalk:
+            // auto, ar, zh-cn, zh, cs, nl, en, fr, de, hu, hi, it, ja, ko, pl, pt, ru, es, tr
+
+            if (string.IsNullOrWhiteSpace(s))
+                return "en";
+
+            // Common human inputs / locale inputs -> valid codes
+            if (s is "english" or "en-us" or "en_us" or "en-gb" or "en_gb" or "en-uk" or "en_uk" or "en-ca" or "en_ca" or "en-au" or "en_au" or "eng")
+                return "en";
+            if (s is "auto" or "detect")
+                return "auto";
+            if (s is "japanese" or "ja-jp" or "ja_jp" or "jp")
+                return "ja";
+            if (s is "korean" or "ko-kr" or "ko_kr" or "kr")
+                return "ko";
+            if (s is "chinese" or "zh-hans" or "zh_cn" or "zh-cn")
+                return "zh-cn";
+            if (s is "zh-tw" or "zh_tw" or "zh-hant" or "zh_hant")
+                return "zh";
+            if (s is "spanish" or "es-es" or "es_es" or "es-mx" or "es_mx")
+                return "es";
+            if (s is "portuguese" or "pt-br" or "pt_br" or "pt-pt" or "pt_pt")
+                return "pt";
+            if (s is "french" or "fr-fr" or "fr_fr" or "fr-ca" or "fr_ca")
+                return "fr";
+            if (s is "german" or "de-de" or "de_de")
+                return "de";
+            if (s is "russian" or "ru-ru" or "ru_ru")
+                return "ru";
+            if (s is "italian" or "it-it" or "it_it")
+                return "it";
+            if (s is "hindi" or "hi-in" or "hi_in")
+                return "hi";
+            if (s is "arabic" or "ar-sa" or "ar_sa")
+                return "ar";
+            if (s is "turkish" or "tr-tr" or "tr_tr")
+                return "tr";
+            if (s is "dutch" or "nl-nl" or "nl_nl")
+                return "nl";
+            if (s is "czech" or "cs-cz" or "cs_cz")
+                return "cs";
+            if (s is "hungarian" or "hu-hu" or "hu_hu")
+                return "hu";
+            if (s is "polish" or "pl-pl" or "pl_pl")
+                return "pl";
+
+            // If they already typed a valid code, pass it through
+            return s switch
+            {
+                "auto" or "ar" or "zh-cn" or "zh" or "cs" or "nl" or "en" or "fr" or "de" or "hu" or "hi" or "it" or "ja" or "ko" or "pl" or "pt" or "ru" or "es" or "tr"
+                    => s,
+                _ => "en"
+            };
+        }
     }
 
     [Serializable]
     public class VoiceBucket
     {
-        public string Name { get; set; } = "";               // e.g. "male"
-        public List<string> Voices { get; set; } = new();    // list of filenames from /api/voices
+        public string Name { get; set; } = "";
+        public List<string> Voices { get; set; } = new();
     }
 
     [Serializable]
     public class BucketKeywordRule
     {
-        public string Keyword { get; set; } = "";        // substring match in npcKey (case-insensitive)
-        public string BucketName { get; set; } = "";     // bucket to use
+        public string Keyword { get; set; } = "";
+        public string BucketName { get; set; } = "";
     }
 
     [Serializable]
     public class NpcContainsVoiceRule
     {
-        public string Match { get; set; } = "";  // substring match in npcKey
-        public string Voice { get; set; } = "";  // forced voice filename
+        public string Match { get; set; } = "";
+        public string Voice { get; set; } = "";
     }
 
     [Serializable]
     public class NpcExactBucketOverride
     {
-        public string NpcKey { get; set; } = "";      // exact npc key/name
-        public string BucketName { get; set; } = "";  // forced bucket name
+        public string NpcKey { get; set; } = "";
+        public string BucketName { get; set; } = "";
     }
 
     [Serializable]
     public class NpcExactVoiceOverride
     {
-        public string NpcKey { get; set; } = "";  // exact npc key/name
-        public string Voice { get; set; } = "";   // forced voice filename
+        public string NpcKey { get; set; } = "";
+        public string Voice { get; set; } = "";
     }
 
     [Serializable]
     public class NpcAssignedVoice
     {
-        public string NpcKey { get; set; } = "";     // exact npc key/name
-        public string BucketName { get; set; } = ""; // bucket used when assigned
-        public string Voice { get; set; } = "";      // assigned voice filename
+        public string NpcKey { get; set; } = "";
+        public string BucketName { get; set; } = "";
+        public string Voice { get; set; } = "";
     }
 }

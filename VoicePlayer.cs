@@ -2,7 +2,6 @@
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using System;
-using System.Data;
 using System.IO;
 
 namespace NpcVoiceMaster
@@ -36,23 +35,36 @@ namespace NpcVoiceMaster
 
                     _audioStream = new MemoryStream(audioData, writable: false);
 
-                    // Auto-detect WAV vs MP3
+                    // Decode
+                    WaveStream decoded;
                     if (LooksLikeWav(audioData))
                     {
-                        _audioReader = new WaveFileReader(_audioStream);
-                        Log?.Invoke($"[VoicePlayer] WAV decoded OK. Duration={_audioReader.TotalTime}");
+                        decoded = new WaveFileReader(_audioStream);
+                        Log?.Invoke($"[VoicePlayer] WAV decoded OK. Duration={decoded.TotalTime}");
                     }
                     else
                     {
-                        _audioReader = new Mp3FileReader(_audioStream);
-                        Log?.Invoke($"[VoicePlayer] MP3 decoded OK. Duration={_audioReader.TotalTime}");
+                        decoded = new Mp3FileReader(_audioStream);
+                        Log?.Invoke($"[VoicePlayer] MP3 decoded OK. Duration={decoded.TotalTime}");
                     }
 
-                    _outputDevice = new WasapiOut(AudioClientShareMode.Shared, 100);
+                    // Force volume = 1.0 (100%) using a volume wrapper.
+                    // This makes "I didn't hear anything" much less likely to be a plugin volume issue.
+                    _audioReader = new WaveChannel32(decoded) { Volume = 1.0f };
+
+                    // Output: WaveOutEvent is the most compatible path on Windows.
+                    // (WasapiOut can get "clever" with routing/exclusive mode and make you think nothing happened.)
+                    var waveOut = new WaveOutEvent
+                    {
+                        DesiredLatency = 100
+                    };
+
+                    _outputDevice = waveOut;
                     _outputDevice.PlaybackStopped += OnPlaybackStopped;
                     _outputDevice.Init(_audioReader);
                     _outputDevice.Play();
-                    Log?.Invoke("[VoicePlayer] Playback started.");
+
+                    Log?.Invoke("[VoicePlayer] Playback started (WaveOutEvent, volume=1.0).");
                 }
                 catch (Exception ex)
                 {
@@ -116,6 +128,7 @@ namespace NpcVoiceMaster
                 using var enumerator = new MMDeviceEnumerator();
                 var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
                 Log?.Invoke($"[VoicePlayer] Default output device: {device.FriendlyName}");
+                Log?.Invoke($"[VoicePlayer] Device state: {device.State}");
             }
             catch (Exception ex)
             {
