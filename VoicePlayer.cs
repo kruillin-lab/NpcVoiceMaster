@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -35,7 +35,13 @@ namespace NPCVoiceMaster
 
                 using var ms = new MemoryStream(wavBytes, writable: false);
                 using var reader = new WaveFileReader(ms);
-                using var output = new WaveOutEvent();
+                // Reduce playback latency to minimize initial buffering noise.
+                using var output = new WaveOutEvent
+                {
+                    // Adjust buffer count and latency. A larger DesiredLatency (ms) can reduce underruns at the cost of a small delay.
+                    DesiredLatency = 150,
+                    NumberOfBuffers = 2
+                };
 
                 var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
