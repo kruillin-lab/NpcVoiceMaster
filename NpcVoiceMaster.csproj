@@ -81,6 +81,7 @@
 	<ItemGroup>
 		<PackageReference Include="NAudio" Version="2.2.1" />
 		<PackageReference Include="DalamudPackager" Version="2.1.13" />
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
 	</ItemGroup>
 
 	<Target Name="CopyToDalamudDevPlugins" AfterTargets="Build">
