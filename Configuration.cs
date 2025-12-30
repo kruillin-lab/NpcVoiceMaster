@@ -96,9 +96,20 @@ namespace NPCVoiceMaster
             MigrateAndClean();
         }
 
+        // Static lock to serialize configuration saves. Multiple concurrent Save() calls can
+        // corrupt the underlying SQLite transaction in Dalamud's ReliableFileStorage, leading
+        // to "cannot rollback - no transaction is active" errors. Serialize all
+        // plugin config writes to avoid conflicting transactions.
+        private static readonly object _saveLock = new object();
+
         public void Save()
         {
-            _pi!.SavePluginConfig(this);
+            if (_pi == null)
+                return;
+            lock (_saveLock)
+            {
+                _pi.SavePluginConfig(this);
+            }
         }
 
         private void MigrateAndClean()

@@ -38,8 +38,8 @@ namespace NPCVoiceMaster
                 // Reduce playback latency to minimize initial buffering noise.
                 using var output = new WaveOutEvent
                 {
-                    // Reduce buffer count and latency to minimize perceived delay at start.
-                    DesiredLatency = 50,
+                    // Adjust buffer count and latency. A larger DesiredLatency (ms) can reduce underruns at the cost of a small delay.
+                    DesiredLatency = 150,
                     NumberOfBuffers = 2
                 };
 

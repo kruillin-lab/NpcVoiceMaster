@@ -7,11 +7,14 @@ using Newtonsoft.Json;
 public class PlayerVoiceManager
 {
     private readonly string filePath;
+    // Store player voice assignments. Use case-insensitive keys so that player names
+    // are treated the same regardless of capitalization.
     private Dictionary<string, string> playerVoices;
 
     public PlayerVoiceManager(string filePath)
     {
         this.filePath = filePath;
+        // Initialize the dictionary with loaded values and ensure case-insensitive lookup
         this.playerVoices = LoadPlayerVoices();
     }
 
@@ -20,10 +23,15 @@ public class PlayerVoiceManager
     {
         if (File.Exists(filePath))
         {
-            string json = File.ReadAllText(filePath);
-            return JsonConvert.DeserializeObject<Dictionary<string, string>>(json) ?? new Dictionary<string, string>();
+            var json = File.ReadAllText(filePath);
+            // Deserialize into a temporary dictionary (case-sensitive) and then copy
+            // into a new dictionary with a case-insensitive comparer. This avoids
+            // having multiple conflicting entries for names that differ only by case.
+            var tmp = JsonConvert.DeserializeObject<Dictionary<string, string>>(json) ?? new Dictionary<string, string>();
+            return new Dictionary<string, string>(tmp, StringComparer.OrdinalIgnoreCase);
         }
-        return new Dictionary<string, string>();
+        // Create an empty case-insensitive dictionary by default.
+        return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
 
     // Save player voices to the JSON file
@@ -34,10 +42,13 @@ public class PlayerVoiceManager
     }
 
     // Get the voice assigned to a player
-    public string GetPlayerVoice(string playerName)
+    public string? GetPlayerVoice(string playerName)
     {
-        if (string.IsNullOrEmpty(playerName)) return null;  // Return null if playerName is empty
-        return playerVoices.ContainsKey(playerName) ? playerVoices[playerName] : null;
+        // Return null if playerName is null or empty
+        if (string.IsNullOrWhiteSpace(playerName)) return null;
+
+        // Try to retrieve the voice assignment; return null if not found
+        return playerVoices.TryGetValue(playerName, out var voice) ? voice : null;
     }
 
     // Assign a voice to a player
