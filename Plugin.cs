@@ -57,7 +57,16 @@ private readonly IDalamudPluginInterface _pi;
 
         private readonly SemaphoreSlim _speakQueue = new(1, 1);
 
-        private string _lastTalkKeyInternal = "";
+        // Removed unused _lastTalkKeyInternal field. Originally used to suppress repeated identical lines,
+        // the plugin now allows the same line to be spoken consecutively. Keeping this field unused
+        // triggers CS0414 warnings, so it has been removed.
+
+        /// <summary>
+        /// Folder name used to store cached audio generated for player-controlled dialogue. Files in this
+        /// folder are subject to periodic cleanup (e.g., daily) to avoid unbounded growth. NPC dialogue
+        /// caches are stored under their NPC name and are not removed automatically.
+        /// </summary>
+        private const string PlayerCacheFolder = "__player";
 
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> CacheLocks = new(StringComparer.OrdinalIgnoreCase);
         private static readonly Regex TokenSplit = new Regex(@"[^a-zA-Z0-9]+", RegexOptions.Compiled);
@@ -146,6 +155,17 @@ private System.Threading.Tasks.Task? _previewTask = null;
 Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw);
 
             try { Svc.Chat.Print($"[NpcVoiceMaster] Loaded. Cache: {ResolvedCacheFolder}"); } catch { }
+
+            // On startup, prune any cached player dialogue older than one day. This prevents stale
+            // player-generated audio from accumulating over time. NPC dialogue caches remain untouched.
+            try
+            {
+                CleanOldPlayerCache(TimeSpan.FromDays(1));
+            }
+            catch
+            {
+                // Swallow cleanup failures; they should not block plugin initialization.
+            }
         }
 
         public void Dispose()
@@ -286,6 +306,25 @@ public void PreviewVoice(string voiceName, string? testLine)
     _ = PreviewVoiceLineQueuedAsync(voiceName, line);
 }
 
+
+public void StopPreviewVoice()
+{
+    System.Threading.CancellationTokenSource? cts;
+    lock (_previewSync)
+    {
+        cts = _previewCts;
+    }
+
+    try
+    {
+        cts?.Cancel();
+    }
+    catch
+    {
+        // ignore
+    }
+}
+
 private async Task PreviewVoiceLineQueuedAsync(string voiceName, string lineText)
 {
     // Cancel any in-flight/playing preview so the new preview starts ASAP.
@@ -311,17 +350,24 @@ private async Task PreviewVoiceLineQueuedAsync(string voiceName, string lineText
     var token = newCts.Token;
 
     // Serialize TTS generation with the rest of the plugin, but do NOT block on playback.
-    await _speakQueue.WaitAsync().ConfigureAwait(false);
     try
     {
-        if (token.IsCancellationRequested)
-            return;
-
-        var audio = await GetOrCreateCachedTtsAsync("__VoiceTest__", lineText, voiceName).ConfigureAwait(false);
-        if (audio == null || audio.Length == 0)
-            return;
+        await _speakQueue.WaitAsync(token).ConfigureAwait(false);
 
         if (token.IsCancellationRequested)
+        {
+            _speakQueue.Release();
+            return;
+        }
+
+        // For preview lines, allow caching but tag them as player dialogue. Caches in the player folder are
+        // automatically cleaned up after a retention period to prevent unbounded growth.
+        var audio = await GetOrCreateCachedTtsAsync("__VoiceTest__", lineText, voiceName, useCache: true, isPlayerCache: true).ConfigureAwait(false);
+
+        // Release the semaphore immediately so subsequent lines can queue while the audio plays.
+        _speakQueue.Release();
+
+        if (audio == null || audio.Length == 0 || token.IsCancellationRequested)
             return;
 
         var playTask = _player.PlayAudioAsync(audio, token);
@@ -341,13 +387,15 @@ private async Task PreviewVoiceLineQueuedAsync(string voiceName, string lineText
             catch { }
         }, System.Threading.Tasks.TaskScheduler.Default);
     }
+    catch (OperationCanceledException)
+    {
+        // Ignore cancellations
+    }
     catch (Exception ex)
     {
+        // Make sure to release the semaphore if an exception occurs after acquisition.
+        try { _speakQueue.Release(); } catch { }
         Svc.Log.Error(ex, "[NpcVoiceMaster] PreviewVoiceLineQueuedAsync failed.");
-    }
-    finally
-    {
-        _speakQueue.Release();
     }
 }
 
@@ -1154,13 +1202,8 @@ private void SetBucketForCurrentTarget(string bucketName)
                 if (string.IsNullOrWhiteSpace(line))
                     return;
 
-                var key = LastTalkKey;
-
-                if (key == _lastTalkKeyInternal)
-                    return;
-
-                _lastTalkKeyInternal = key;
-
+                // Previously, repeated identical lines were suppressed to avoid duplicate playback.
+                // This behaviour has been removed so that the same line can be spoken consecutively if desired.
                 _ = SpeakTalkLineQueuedAsync(string.IsNullOrWhiteSpace(npc) ? "Unknown" : npc, line);
             }
             catch (Exception ex)
@@ -1245,24 +1288,53 @@ private void SetBucketForCurrentTarget(string bucketName)
                 return "";
 
             s = s.Replace("\u0002", "").Replace("\u0003", "").Trim();
+
+            // Remove any trailing [+number] tokens (e.g., "Hello there [+1]") which are not part of the actual dialog.
+            // This pattern matches a plus sign with digits inside square brackets at the end of the string.
+            s = Regex.Replace(s, @"\[\+\d+\]$", "").Trim();
+
+            // Collapse multiple whitespace characters into a single space.
             s = Regex.Replace(s, @"\s+", " ");
             return s;
         }
 
         private async Task SpeakTalkLineQueuedAsync(string npcName, string lineText)
         {
+            // Serialize TTS generation so we don't overload AllTalk with concurrent requests.
             await _speakQueue.WaitAsync();
+            byte[]? audio = null;
             try
             {
                 var voice = ResolveVoiceForNpc(npcName);
                 if (string.IsNullOrWhiteSpace(voice))
                     return;
 
-                var audio = await GetOrCreateCachedTtsAsync(npcName, lineText, voice);
-                if (audio == null || audio.Length == 0)
-                    return;
+                // Determine if this line originates from the local player. A line is considered player-controlled if
+                // the NPC name matches the local player's character name (case-insensitive) or if the NPC name is
+                // "Unknown" (used as a fallback when no name is detected). For player lines, disable caching so the
+                // line can be repeated immediately without reusing the cached audio. When not a player line, caching
+                // is enabled to avoid redundant TTS requests.
+                var localPlayerName = Svc.Objects.LocalPlayer?.Name?.TextValue ?? "";
+                var isPlayerNameMatch = !string.IsNullOrWhiteSpace(localPlayerName) &&
+                               string.Equals(localPlayerName.Trim(), npcName, StringComparison.OrdinalIgnoreCase);
 
-                _player.PlayAudio(audio);
+                // Check if this NPC has been manually tagged as a player ("pc") in its profile. A pc tag on either
+                // required or preferred voice-tags indicates that the user wants this character treated as a player for
+                // caching and cleanup purposes.
+                bool isTaggedPlayer = false;
+                if (Configuration.NpcProfiles != null &&
+                    Configuration.NpcProfiles.TryGetValue(npcName, out var np) &&
+                    np != null)
+                {
+                    var reqSet = TagUtil.ToSet(np.RequiredVoiceTags);
+                    var prefSet = TagUtil.ToSet(np.PreferredVoiceTags);
+                    isTaggedPlayer = reqSet.Contains("pc") || prefSet.Contains("pc");
+                }
+
+                var isPlayer = isPlayerNameMatch || isTaggedPlayer;
+                var isPlayerCache = isPlayer || string.Equals(npcName, "Unknown", StringComparison.OrdinalIgnoreCase);
+                var useCache = !isPlayer;
+                audio = await GetOrCreateCachedTtsAsync(npcName, lineText, voice, useCache: useCache, isPlayerCache: isPlayerCache);
             }
             catch (Exception ex)
             {
@@ -1271,6 +1343,19 @@ private void SetBucketForCurrentTarget(string bucketName)
             finally
             {
                 _speakQueue.Release();
+            }
+
+            // Play the audio outside of the semaphore to avoid blocking subsequent lines from queuing.
+            if (audio != null && audio.Length > 0)
+            {
+                try
+                {
+                    _player.PlayAudio(audio);
+                }
+                catch (Exception ex)
+                {
+                    Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync playback failed.");
+                }
             }
         }
 
@@ -1918,20 +2003,32 @@ private void SetBucketForCurrentTarget(string bucketName)
             return sb.ToString();
         }
 
-        private async Task<byte[]?> GetOrCreateCachedTtsAsync(string npcName, string text, string voice)
+        private async Task<byte[]?> GetOrCreateCachedTtsAsync(string npcName, string text, string voice, bool useCache = true, bool isPlayerCache = false)
         {
-            var path = GetCacheFilePath(npcName, voice, text);
+            // If caching is disabled (e.g., for one-off player voice lines), bypass the cache entirely.
+            if (!useCache)
+            {
+                return await GenerateTtsAndDownloadAsync(text, voice);
+            }
 
+            // For player caches, store all audio under a dedicated folder rather than the NPC name. This makes it
+            // easy to prune old player dialogue independently of NPC dialogue. When not a player cache, use the
+            // provided npcName as before.
+            var nameForCache = isPlayerCache ? PlayerCacheFolder : npcName;
+            var path = GetCacheFilePath(nameForCache, voice, text);
+
+            // Try fast path: return cached audio if present.
             if (File.Exists(path))
             {
                 try { return await File.ReadAllBytesAsync(path); }
-                catch { }
+                catch { /* ignore read failures, regenerate below */ }
             }
 
             var sem = CacheLocks.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
             await sem.WaitAsync();
             try
             {
+                // Re-check after acquiring the lock in case another thread generated the file.
                 if (File.Exists(path))
                     return await File.ReadAllBytesAsync(path);
 
@@ -2040,6 +2137,46 @@ private void SetBucketForCurrentTarget(string bucketName)
                 return null;
 
             return await _http.GetByteArrayAsync($"{baseUrl}{relUrl}");
+        }
+
+        /// <summary>
+        /// Removes cached audio files generated for player dialogue that are older than the specified retention period.
+        /// Only files stored under the PlayerCacheFolder folder are considered. NPC caches are not touched.
+        /// </summary>
+        /// <param name="retention">The maximum age of files to keep. Files older than this will be deleted.</param>
+        private void CleanOldPlayerCache(TimeSpan retention)
+        {
+            if (retention <= TimeSpan.Zero)
+                return;
+
+            try
+            {
+                var root = ResolvedCacheFolder;
+                var playerDir = Path.Combine(root, PlayerCacheFolder);
+                if (!Directory.Exists(playerDir))
+                    return;
+
+                var now = DateTime.UtcNow;
+                foreach (var file in Directory.EnumerateFiles(playerDir, "*.wav", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        var info = new FileInfo(file);
+                        if (now - info.LastWriteTimeUtc > retention)
+                        {
+                            info.Delete();
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore individual file deletion errors and continue with the next file.
+                    }
+                }
+            }
+            catch
+            {
+                // Swallow any unexpected exceptions during cleanup; this should never crash the plugin.
+            }
         }
 
         private Configuration LoadConfigurationSafe()
