@@ -4,6 +4,8 @@ using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
+using Dalamud.Bindings.ImGui;
+using System.Numerics;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 
@@ -16,7 +18,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Numerics;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -40,7 +41,8 @@ namespace NPCVoiceMaster
         private const string CmdBot = "/bot";
         private const string CmdMon = "/mon";
 
-        private readonly IDalamudPluginInterface _pi;
+                private const string CmdTag = "/tag";
+private readonly IDalamudPluginInterface _pi;
         private readonly ICommandManager _commands;
 
         public Configuration Configuration { get; private set; }
@@ -65,6 +67,12 @@ namespace NPCVoiceMaster
         public string LastTalkLine { get; private set; } = "";
         public string LastTalkKey { get; private set; } = "";
         public DateTime LastTalkAt { get; private set; } = DateTime.MinValue;
+
+        // New NPC suggestion popup state
+        private bool _newNpcPopupOpen = false;
+        private string _newNpcPopupName = "";
+        private NpcProfile? _newNpcPopupProfile = null;
+        private bool _tagPopupManual = false;
 
         public string LastDetectedGender { get; private set; } = "unknown";
         public string LastResolvedBucket { get; private set; } = "";
@@ -100,30 +108,35 @@ namespace NPCVoiceMaster
 
             _commands.AddHandler(CmdMale, new CommandInfo((c, a) => SetBucketForCurrentTarget("male"))
             {
-                HelpMessage = "Set bucket override for current target to: male"
+                HelpMessage = "Add required voice-tag for current target NPC: male"
             });
 
             _commands.AddHandler(CmdLady, new CommandInfo((c, a) => SetBucketForCurrentTarget("woman"))
             {
-                HelpMessage = "Set bucket override for current target to: woman"
+                HelpMessage = "Add required voice-tag for current target NPC: woman"
             });
 
             _commands.AddHandler(CmdWay, new CommandInfo((c, a) => SetBucketForCurrentTarget("loporrit"))
             {
-                HelpMessage = "Set bucket override for current target to: loporrit (Way)"
+                HelpMessage = "Add required voice-tag for current target NPC: loporrit"
             });
 
             _commands.AddHandler(CmdBot, new CommandInfo((c, a) => SetBucketForCurrentTarget("machine"))
             {
-                HelpMessage = "Set bucket override for current target to: machine"
+                HelpMessage = "Add required voice-tag for current target NPC: machine"
             });
 
             _commands.AddHandler(CmdMon, new CommandInfo((c, a) => SetBucketForCurrentTarget("monsters"))
             {
-                HelpMessage = "Set bucket override for current target to: monsters"
+                HelpMessage = "Add required voice-tag for current target NPC: monsters"
             });
 
-            Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw);
+                        _commands.AddHandler(CmdTag, new CommandInfo(OnTagCommand)
+            {
+                HelpMessage = "Open tag editor popup for your current target (suggested tags + current voice)."
+            });
+
+Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw);
 
             try { Svc.Chat.Print($"[NpcVoiceMaster] Loaded. Cache: {ResolvedCacheFolder}"); } catch { }
         }
@@ -156,8 +169,342 @@ namespace NPCVoiceMaster
             ConfigWindow.IsOpen = !ConfigWindow.IsOpen;
         }
 
-        private void DrawUI() => WindowSystem.Draw();
+        private void OnTagCommand(string command, string args)
+        {
+            try
+            {
+                var npcName = GetCurrentTargetNpcName();
+                if (string.IsNullOrWhiteSpace(npcName))
+                {
+                    try { Svc.Chat.Print("[NpcVoiceMaster] /tag: No target selected."); } catch { }
+                    return;
+                }
+
+                npcName = npcName.Trim();
+
+                Configuration.NpcProfiles ??= new Dictionary<string, NpcProfile>(StringComparer.OrdinalIgnoreCase);
+                Configuration.KnownNpcTags ??= new List<string>();
+
+                // Work on a copy so Cancel doesn't mutate live config.
+                NpcProfile working;
+                if (Configuration.NpcProfiles.TryGetValue(npcName, out var existing) && existing != null)
+                {
+                    working = CloneNpcProfile(existing);
+                }
+                else
+                {
+                    working = new NpcProfile();
+                    working.RequiredVoiceTags ??= new List<string>();
+                    working.PreferredVoiceTags ??= new List<string>();
+                    working.NpcTags ??= new List<string>();
+
+                    // Suggest tags from name/title
+                    var suggested = AutoTagger.SuggestNpcVoiceTagsFromName(npcName);
+
+                    // Core/bucket-ish tags go in required; identity-ish tags go in preferred.
+                    var core = new HashSet<string>(new[]
+                    {
+                        "male","woman","boy","girl","loporrit","machine","monsters","default",
+                        "big monster","little monster"
+                    }, StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var t in suggested)
+                    {
+                        if (core.Contains(t))
+                            TagUtil.AddTag(working.RequiredVoiceTags, t);
+                        else
+                            TagUtil.AddTag(working.PreferredVoiceTags, t);
+                    }
+
+                    working.RequiredVoiceTags = TagUtil.NormDistinct(working.RequiredVoiceTags);
+                    working.PreferredVoiceTags = TagUtil.NormDistinct(working.PreferredVoiceTags);
+                }
+
+                _newNpcPopupName = npcName;
+                _newNpcPopupProfile = working;
+                _newNpcPopupOpen = true;
+                _tagPopupManual = true;
+            }
+            catch
+            {
+                try { Svc.Chat.Print("[NpcVoiceMaster] /tag: failed to open tag editor."); } catch { }
+            }
+        }
+
+        private static NpcProfile CloneNpcProfile(NpcProfile src)
+        {
+            var dst = new NpcProfile();
+            dst.RequiredVoiceTags = src.RequiredVoiceTags != null ? new List<string>(src.RequiredVoiceTags) : new List<string>();
+            dst.PreferredVoiceTags = src.PreferredVoiceTags != null ? new List<string>(src.PreferredVoiceTags) : new List<string>();
+            dst.NpcTags = src.NpcTags != null ? new List<string>(src.NpcTags) : new List<string>();
+            dst.Tone = src.Tone;
+            dst.Accent = src.Accent;
+            return dst;
+        }
+
+        private string GetCurrentVoicePreview(string npcName)
+        {
+            npcName = (npcName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(npcName))
+                return "(none)";
+
+            var ov = Configuration.NpcExactVoiceOverrides?
+                .FirstOrDefault(x => x != null && x.Enabled && x.NpcKey.Equals(npcName, StringComparison.OrdinalIgnoreCase));
+
+            if (ov != null && !string.IsNullOrWhiteSpace(ov.Voice))
+                return $"override: {ov.Voice.Trim()}";
+
+            if (Configuration.NpcAssignedVoices != null && Configuration.NpcAssignedVoices.TryGetValue(npcName, out var av) && !string.IsNullOrWhiteSpace(av))
+                return $"assigned: {av.Trim()}";
+
+            if (!string.IsNullOrWhiteSpace(LastResolvedVoice))
+                return $"resolved: {LastResolvedVoice}";
+
+            return "(unknown)";
+        }
+
+
+
+        private void DrawUI()
+        {
+            WindowSystem.Draw();
+            DrawNewNpcPopup();
+        }
         private void DrawConfigUI() => ConfigWindow.IsOpen = true;
+
+        private void MaybeQueueNewNpcPopup(string npcName)
+        {
+            if (!Configuration.EnableNewNpcPopup)
+                return;
+
+            npcName = (npcName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(npcName))
+                return;
+
+            // Don't spam while a popup is already pending
+            if (_newNpcPopupOpen)
+                return;
+
+            // Already has a profile? Don't prompt.
+            if (Configuration.NpcProfiles.ContainsKey(npcName))
+                return;
+
+            // Ignored? Don't prompt.
+            if (Configuration.IgnoredNpcPopup != null && Configuration.IgnoredNpcPopup.Any(x => string.Equals(x, npcName, StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            // Create profile now so the UI edits a stable object
+            var profile = new NpcProfile();
+            profile.RequiredVoiceTags ??= new List<string>();
+            profile.PreferredVoiceTags ??= new List<string>();
+            profile.NpcTags ??= new List<string>();
+
+            // Suggest tags from name/title
+            var suggested = AutoTagger.SuggestNpcVoiceTagsFromName(npcName);
+
+            // Put “identity” style tags in preferred unless they're one of the core bucket tags
+            var core = new HashSet<string>(new[] { "male","woman","boy","girl","loporrit","machine","monsters","default","big monster","little monster" }, StringComparer.OrdinalIgnoreCase);
+            foreach (var t in suggested)
+            {
+                if (core.Contains(t))
+                    TagUtil.AddTag(profile.RequiredVoiceTags, t);
+                else
+                    TagUtil.AddTag(profile.PreferredVoiceTags, t);
+            }
+
+            profile.RequiredVoiceTags = TagUtil.NormDistinct(profile.RequiredVoiceTags);
+            profile.PreferredVoiceTags = TagUtil.NormDistinct(profile.PreferredVoiceTags);
+
+            Configuration.NpcProfiles[npcName] = profile;
+            Configuration.Save();
+
+            _newNpcPopupName = npcName;
+            _newNpcPopupProfile = profile;
+            _tagPopupManual = false;
+            _newNpcPopupOpen = true;
+        }
+
+        private void DrawNewNpcPopup()
+        {
+            if (!_newNpcPopupOpen || _newNpcPopupProfile == null)
+                return;
+
+            // Minimal UI: we keep it simple and editable.
+            ImGui.SetNextWindowSizeConstraints(new Vector2(480, 0), new Vector2(720, 520));
+            var popupTitle = _tagPopupManual ? "Tag target (suggested)" : "New NPC detected";
+            ImGui.OpenPopup(popupTitle);
+
+            bool open = true;
+            if (ImGui.BeginPopupModal(popupTitle, ref open, ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                ImGui.TextUnformatted($"NPC: {_newNpcPopupName}");
+                ImGui.TextUnformatted($"Current voice (preview): {GetCurrentVoicePreview(_newNpcPopupName)}");
+                ImGui.Separator();
+
+                ImGui.TextUnformatted(_tagPopupManual ? "Edit tags for this target, then save." : "Suggested tags are pre-filled. Edit if needed, then choose:");
+                ImGui.Spacing();
+
+                var allNpcTags = Configuration.KnownNpcTags ?? new List<string>();
+                var profile = _newNpcPopupProfile;
+
+                profile.RequiredVoiceTags ??= new List<string>();
+                profile.PreferredVoiceTags ??= new List<string>();
+
+                DrawTagMultiSelectPopup("Required voice-tags", "npc_popup_req", profile.RequiredVoiceTags, allNpcTags);
+                DrawTagMultiSelectPopup("Preferred voice-tags", "npc_popup_pref", profile.PreferredVoiceTags, allNpcTags);
+
+                ImGui.Separator();
+
+                // Accent/Tone dropdowns using known lists
+                var accents = (Configuration.KnownAccents ?? new List<string>());
+                var tones = (Configuration.KnownTones ?? new List<string>());
+
+                var acc = profile.Accent ?? "";
+                if (DrawStringComboPopup("Accent", "npc_popup_acc", ref acc, accents, 260f))
+                    profile.Accent = string.IsNullOrWhiteSpace(acc) ? null : acc;
+
+                var tone = profile.Tone ?? "";
+                if (DrawStringComboPopup("Tone", "npc_popup_tone", ref tone, tones, 260f))
+                    profile.Tone = string.IsNullOrWhiteSpace(tone) ? null : tone;
+
+                ImGui.Spacing();
+                ImGui.Separator();
+
+                if (ImGui.Button("Yes (save)"))
+                {
+                    profile.RequiredVoiceTags = TagUtil.NormDistinct(profile.RequiredVoiceTags);
+                    profile.PreferredVoiceTags = TagUtil.NormDistinct(profile.PreferredVoiceTags);
+
+                    // Commit profile (manual /tag uses a working copy)
+                    Configuration.NpcProfiles ??= new Dictionary<string, NpcProfile>(StringComparer.OrdinalIgnoreCase);
+                    Configuration.NpcProfiles[_newNpcPopupName] = profile;
+
+                    // Learn vocab
+                    Configuration.KnownNpcTags ??= new List<string>();
+                    foreach (var t in profile.RequiredVoiceTags) TagUtil.AddTag(Configuration.KnownNpcTags, t);
+                    foreach (var t in profile.PreferredVoiceTags) TagUtil.AddTag(Configuration.KnownNpcTags, t);
+                    if (!string.IsNullOrWhiteSpace(profile.Accent))
+                    {
+                        Configuration.KnownAccents ??= new List<string>();
+                        TagUtil.AddTag(Configuration.KnownAccents, profile.Accent);
+                    }
+                    if (!string.IsNullOrWhiteSpace(profile.Tone))
+                    {
+                        Configuration.KnownTones ??= new List<string>();
+                        TagUtil.AddTag(Configuration.KnownTones, profile.Tone);
+                    }
+
+                    Configuration.KnownNpcTags = TagUtil.NormDistinct(Configuration.KnownNpcTags);
+                    Configuration.KnownAccents = TagUtil.NormDistinct(Configuration.KnownAccents ?? new List<string>());
+                    Configuration.KnownTones = TagUtil.NormDistinct(Configuration.KnownTones ?? new List<string>());
+                    Configuration.Save();
+
+                    _newNpcPopupOpen = false;
+                    _tagPopupManual = false;
+                    ImGui.CloseCurrentPopup();
+                }
+                ImGui.SameLine();
+                if (!_tagPopupManual && ImGui.Button("No (don't ask again)"))
+                {
+                    Configuration.IgnoredNpcPopup ??= new List<string>();
+                    Configuration.IgnoredNpcPopup.Add(_newNpcPopupName);
+                    Configuration.IgnoredNpcPopup = Configuration.IgnoredNpcPopup.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    Configuration.Save();
+
+                    // Remove the auto-created profile to avoid clutter
+                    Configuration.NpcProfiles.Remove(_newNpcPopupName);
+                    Configuration.Save();
+
+                    _newNpcPopupOpen = false;
+                    _tagPopupManual = false;
+                    ImGui.CloseCurrentPopup();
+                }
+                ImGui.SameLine();
+                if (ImGui.Button(_tagPopupManual ? "Cancel" : "Cancel (ask later)"))
+                {
+                    // Keep profile but don't keep popup open
+                    _newNpcPopupOpen = false;
+                    _tagPopupManual = false;
+                    ImGui.CloseCurrentPopup();
+                }
+
+                ImGui.EndPopup();
+            }
+
+            if (!open)
+            {
+                _newNpcPopupOpen = false;
+                _tagPopupManual = false;
+            }
+        }
+
+        // --- Tiny popup-local widgets (no dependency on ConfigWindow) ---
+
+        private void DrawTagMultiSelectPopup(string label, string id, List<string> selected, List<string> allOptions)
+        {
+            ImGui.TextUnformatted(label);
+
+            ImGui.SetNextItemWidth(520f);
+            if (ImGui.BeginCombo($"##{id}", selected.Count == 0 ? "(none)" : string.Join(", ", selected)))
+            {
+                foreach (var opt in allOptions.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    var norm = TagUtil.Norm(opt);
+                    if (string.IsNullOrWhiteSpace(norm))
+                        continue;
+
+                    bool isSel = selected.Any(x => string.Equals(TagUtil.Norm(x), norm, StringComparison.OrdinalIgnoreCase));
+                    if (ImGui.Selectable($"{opt}##{id}_{opt}", isSel, ImGuiSelectableFlags.DontClosePopups))
+                    {
+                        if (isSel)
+                            selected.RemoveAll(x => string.Equals(TagUtil.Norm(x), norm, StringComparison.OrdinalIgnoreCase));
+                        else
+                            selected.Add(opt);
+
+                        // normalize in-place
+                        var n = TagUtil.NormDistinct(selected);
+                        selected.Clear();
+                        selected.AddRange(n);
+                    }
+                }
+
+                ImGui.EndCombo();
+            }
+        }
+
+        private bool DrawStringComboPopup(string label, string id, ref string value, List<string> options, float width)
+        {
+            ImGui.SetNextItemWidth(width);
+            var preview = string.IsNullOrWhiteSpace(value) ? "(none)" : value;
+
+            ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, 420));
+            if (ImGui.BeginCombo($"{label}##{id}", preview))
+            {
+                if (ImGui.Selectable("(none)", string.IsNullOrWhiteSpace(value), ImGuiSelectableFlags.DontClosePopups))
+                {
+                    value = "";
+                    ImGui.EndCombo();
+                    return true;
+                }
+
+                foreach (var o in options.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrWhiteSpace(o)) continue;
+                    bool sel = string.Equals(value, o, StringComparison.OrdinalIgnoreCase);
+                    if (ImGui.Selectable(o, sel, ImGuiSelectableFlags.DontClosePopups))
+                    {
+                        value = o;
+                        ImGui.EndCombo();
+                        return true;
+                    }
+                }
+
+                ImGui.EndCombo();
+            }
+
+            return false;
+        }
+
 
         public void SetDebugOverlayOpen(bool open)
         {
@@ -166,8 +513,291 @@ namespace NPCVoiceMaster
             Configuration.Save();
         }
 
-        private void SetBucketForCurrentTarget(string bucketName)
+        
+        // UI helpers (kept thin; core logic lives in the same code paths as the chat commands).
+        public void ToggleRequiredVoiceTagForCurrentTarget(string tag)
         {
+            ToggleRequiredVoiceTagForNpcName(GetCurrentTargetNpcName(), tag);
+        }
+
+        public void ClearCurrentTargetNpcCompletely()
+        {
+            var name = GetCurrentTargetNpcName();
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                try { Svc.Chat.Print("[NpcVoiceMaster] No target selected."); } catch { }
+                return;
+            }
+
+            ClearNpcCompletely(name);
+        }
+
+        public void ToggleRequiredVoiceTagForNpcName(string? npcName, string tag)
+        {
+            try
+            {
+                npcName = (npcName ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(npcName))
+                {
+                    try { Svc.Chat.Print("[NpcVoiceMaster] NPC name is empty."); } catch { }
+                    return;
+                }
+
+                tag = TagUtil.Norm(tag);
+                if (string.IsNullOrWhiteSpace(tag))
+                {
+                    try { Svc.Chat.Print("[NpcVoiceMaster] Tag is empty."); } catch { }
+                    return;
+                }
+
+                Configuration.NpcProfiles ??= new Dictionary<string, NpcProfile>(StringComparer.OrdinalIgnoreCase);
+                if (!Configuration.NpcProfiles.TryGetValue(npcName, out var profile) || profile == null)
+                {
+                    profile = new NpcProfile();
+                    Configuration.NpcProfiles[npcName] = profile;
+                }
+
+                profile.RequiredVoiceTags ??= new List<string>();
+                if (TagUtil.Contains(profile.RequiredVoiceTags, tag))
+                    TagUtil.RemoveTag(profile.RequiredVoiceTags, tag);
+                else
+                    TagUtil.AddTag(profile.RequiredVoiceTags, tag);
+
+                profile.RequiredVoiceTags = TagUtil.NormDistinct(profile.RequiredVoiceTags);
+
+                // Force re-resolve next time (so you immediately see the effect).
+                Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                Configuration.NpcAssignedVoices.Remove(npcName);
+
+                Configuration.Save();
+
+                try { Svc.Chat.Print($"[NpcVoiceMaster] Required voice-tag {(TagUtil.Contains(profile.RequiredVoiceTags, tag) ? "added" : "removed")}: {tag} (NPC: {npcName})"); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { Svc.Log.Error(ex, "ToggleRequiredVoiceTagForNpcName failed"); } catch { }
+            }
+        }
+
+        public void ClearNpcCompletely(string npcName)
+        {
+            try
+            {
+                npcName = (npcName ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(npcName))
+                    return;
+
+                Configuration.NpcProfiles?.Remove(npcName);
+                Configuration.NpcAssignedVoices?.Remove(npcName);
+                Configuration.NpcBucketOverrides?.Remove(npcName);
+
+                if (Configuration.NpcExactVoiceOverrides != null)
+                    Configuration.NpcExactVoiceOverrides.RemoveAll(x => string.Equals(x.NpcName?.Trim(), npcName, StringComparison.OrdinalIgnoreCase));
+
+                Configuration.IgnoredNpcPopup?.RemoveAll(x => string.Equals(x?.Trim(), npcName, StringComparison.OrdinalIgnoreCase));
+
+                Configuration.Save();
+
+                try { Svc.Chat.Print($"[NpcVoiceMaster] Cleared NPC data: {npcName}"); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { Svc.Log.Error(ex, "ClearNpcCompletely failed"); } catch { }
+            }
+        }
+
+        private string GetCurrentTargetNpcName()
+        {
+            try
+            {
+                var target = Svc.Targets.Target;
+                if (target == null)
+                    return string.Empty;
+
+                return (target.Name.TextValue ?? "").Trim();
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+public List<string> GetAllConfiguredVoicesForUi()
+{
+    return GetAllConfiguredVoices();
+}
+
+        public string GetCurrentTargetNameForUi() => GetCurrentTargetNpcName();
+
+
+public string PreviewVoiceForNpc(string npcName)
+{
+    npcName = (npcName ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(npcName))
+        return "";
+
+    // 1) Exact override
+    if (TryGetExactVoiceOverride(npcName, out var exactVoice) && !string.IsNullOrWhiteSpace(exactVoice))
+        return exactVoice;
+
+    // 2) Sticky assignment
+    if (Configuration.NpcAssignedVoices != null &&
+        Configuration.NpcAssignedVoices.TryGetValue(npcName, out var assigned) &&
+        !string.IsNullOrWhiteSpace(assigned))
+        return assigned;
+
+    // 3) Named voice match (no side effects)
+    if (TryMatchVoiceFromNpcName(npcName, out var namedVoice, out _))
+        return namedVoice;
+
+    // 4) Tag-based resolution (no side effects)
+    var byTags = ResolveVoiceByTags(npcName);
+    if (!string.IsNullOrWhiteSpace(byTags))
+        return byTags;
+
+    // 5) Final fallback: non-reserved enabled voices first (never silent)
+    var all = GetAllConfiguredVoices();
+    if (all.Count == 0)
+        return "";
+
+    var eligible = new List<string>(all.Count);
+    foreach (var v in all)
+    {
+        if (Configuration.VoiceProfiles != null &&
+            Configuration.VoiceProfiles.TryGetValue(v, out var vp) &&
+            vp != null &&
+            vp.Reserved)
+            continue;
+
+        eligible.Add(v);
+    }
+
+    if (eligible.Count == 0)
+        eligible = all;
+
+    return eligible[_rng.Next(eligible.Count)];
+}
+
+
+        private bool TryMatchVoiceFromNpcName(string npcName, out string voice, out string reason)
+        {
+            voice = "";
+            reason = "";
+
+            npcName = (npcName ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(npcName))
+                return false;
+
+            // Consider ALL configured voices (including reserved). This is an explicit name match.
+            var all = GetAllConfiguredVoices();
+            if (all.Count == 0)
+                return false;
+
+            // Normalize NPC name for matching.
+            static string Norm(string s)
+            {
+                if (string.IsNullOrWhiteSpace(s)) return "";
+                var sb = new StringBuilder(s.Length);
+                foreach (var ch in s)
+                {
+                    if (char.IsLetterOrDigit(ch))
+                        sb.Append(char.ToLowerInvariant(ch));
+                    else
+                        sb.Append(' ');
+                }
+                return sb.ToString();
+            }
+
+            var npcNorm = Norm(npcName);
+            var npcTokens = npcNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            // Prefer the longest/best match (more specific voice name).
+            string bestVoice = "";
+            int bestScore = 0;
+
+            foreach (var v in all)
+            {
+                var nv = NormalizeVoiceName(v);
+                if (string.IsNullOrWhiteSpace(nv))
+                    continue;
+
+                var baseName = nv;
+                try { baseName = Path.GetFileNameWithoutExtension(nv) ?? nv; } catch { }
+
+                var voiceNorm = Norm(baseName);
+                if (string.IsNullOrWhiteSpace(voiceNorm))
+                    continue;
+
+                // Fast path: substring match on normalized strings.
+                if (!string.IsNullOrWhiteSpace(npcNorm) && npcNorm.Contains(voiceNorm, StringComparison.Ordinal))
+                {
+                    var score = voiceNorm.Length;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestVoice = nv;
+                    }
+                    continue;
+                }
+
+                // Token-order match: all voice tokens appear in NPC tokens in sequence.
+                var voiceTokens = voiceNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (voiceTokens.Length == 0)
+                    continue;
+
+                int ti = 0;
+                for (int ni = 0; ni < npcTokens.Length && ti < voiceTokens.Length; ni++)
+                {
+                    if (npcTokens[ni] == voiceTokens[ti])
+                        ti++;
+                }
+
+                if (ti == voiceTokens.Length)
+                {
+                    var score = voiceTokens.Sum(t => t.Length);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestVoice = nv;
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(bestVoice))
+                return false;
+
+            voice = bestVoice;
+            reason = "npc-name-match";
+            return true;
+        }
+
+
+private bool TryGetExactVoiceOverride(string npcName, out string voice)
+{
+    voice = "";
+    try
+    {
+        if (Configuration.NpcExactVoiceOverrides == null)
+            return false;
+
+        foreach (var o in Configuration.NpcExactVoiceOverrides)
+        {
+            if (o == null) continue;
+            if (string.Equals((o.NpcKey ?? "").Trim(), npcName, StringComparison.OrdinalIgnoreCase))
+            {
+                voice = (o.Voice ?? "").Trim();
+                return true;
+            }
+        }
+    }
+    catch { }
+    return false;
+}
+
+private void SetBucketForCurrentTarget(string bucketName)
+        {
+            // Legacy command name kept for convenience; buckets are gone.
+            // This now adds a REQUIRED voice-tag to the current target NPC profile.
             try
             {
                 var target = Svc.Targets.Target;
@@ -177,27 +807,45 @@ namespace NPCVoiceMaster
                     return;
                 }
 
-                var name = (target.Name?.ToString() ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(name))
+                var npcName = (target.Name.TextValue ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(npcName))
                 {
-                    Svc.Chat.Print("[NpcVoiceMaster] Target has no readable name.");
+                    Svc.Chat.Print("[NpcVoiceMaster] Target has no name.");
                     return;
                 }
 
-                Configuration.NpcBucketOverrides ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var tag = TagUtil.Norm(bucketName);
+                if (string.IsNullOrWhiteSpace(tag))
+                {
+                    Svc.Chat.Print("[NpcVoiceMaster] Tag is empty.");
+                    return;
+                }
 
-                Configuration.NpcBucketOverrides[name] = bucketName;
-                Configuration.NpcAssignedVoices.Remove(name);
+                Configuration.NpcProfiles ??= new Dictionary<string, NpcProfile>(StringComparer.OrdinalIgnoreCase);
+                if (!Configuration.NpcProfiles.TryGetValue(npcName, out var profile) || profile == null)
+                {
+                    profile = new NpcProfile();
+                    Configuration.NpcProfiles[npcName] = profile;
+                }
+
+                profile.RequiredVoiceTags ??= new List<string>();
+                if (TagUtil.Contains(profile.RequiredVoiceTags, tag))
+                    TagUtil.RemoveTag(profile.RequiredVoiceTags, tag);
+                else
+                    TagUtil.AddTag(profile.RequiredVoiceTags, tag);
+                profile.RequiredVoiceTags = TagUtil.NormDistinct(profile.RequiredVoiceTags);
+
+                // Force re-resolve next time (so you immediately see the effect).
+                Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                Configuration.NpcAssignedVoices.Remove(npcName);
 
                 Configuration.Save();
-
-                Svc.Chat.Print($"[NpcVoiceMaster] Set bucket override: {name} -> {bucketName}");
+                Svc.Chat.Print($"[NpcVoiceMaster] Saved required voice-tag for {npcName}: {tag}");
             }
             catch (Exception ex)
             {
-                Svc.Log.Error(ex, "[NpcVoiceMaster] Failed to set bucket override.");
-                try { Svc.Chat.Print($"[NpcVoiceMaster] Failed to set bucket override: {ex.Message}"); } catch { }
+                Svc.Log.Error(ex, "[NpcVoiceMaster] Failed to set NPC required voice-tag.");
+                try { Svc.Chat.Print($"[NpcVoiceMaster] Failed to set NPC required voice-tag: {ex.Message}"); } catch { }
             }
         }
 
@@ -232,6 +880,8 @@ namespace NPCVoiceMaster
                 LastTalkLine = line;
                 LastTalkKey = $"{npc}||{line}";
                 LastTalkAt = DateTime.Now;
+
+                MaybeQueueNewNpcPopup(npc);
 
                 if (string.IsNullOrWhiteSpace(line))
                     return;
@@ -369,144 +1019,73 @@ namespace NPCVoiceMaster
         // ============================================================
 
         // Overload to support call sites that only pass the voice list.
+
+        public string NormalizeVoiceName(string voice)
+        {
+            voice = (voice ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(voice))
+                return "";
+
+            // Strip path if somebody pasted one.
+            try
+            {
+                voice = Path.GetFileName(voice) ?? voice;
+            }
+            catch { }
+
+            // Add .wav if missing
+            if (!voice.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
+                voice += ".wav";
+
+            return voice;
+        }
+
         public void AutoBucketVoicesFromNames(List<string> voiceNames)
             => AutoBucketVoicesFromNames(voiceNames, clearBucketsFirst: false);
 
-        // Primary method (supports the ConfigWindow "clear first" checkbox pattern).
+        // Legacy name kept; buckets are gone. This now auto-TAGS voices from filenames.
         public void AutoBucketVoicesFromNames(List<string> voiceNames, bool clearBucketsFirst)
         {
             voiceNames ??= new List<string>();
 
-            Configuration.VoiceBuckets ??= new List<VoiceBucket>();
-
-            // Ensure the standard buckets exist.
-            EnsureBucketExists("male");
-            EnsureBucketExists("woman");
-            EnsureBucketExists("boy");
-            EnsureBucketExists("girl");
-            EnsureBucketExists("loporrit");
-            EnsureBucketExists("machine");
-            EnsureBucketExists("monsters");
-            EnsureBucketExists("default");
+            Configuration.VoiceProfiles ??= new Dictionary<string, VoiceProfile>(StringComparer.OrdinalIgnoreCase);
 
             if (clearBucketsFirst)
             {
-                foreach (var b in Configuration.VoiceBuckets)
-                    b?.Voices?.Clear();
+                Configuration.VoiceProfiles.Clear();
+
+                // Also clear legacy buckets so old UI/state doesn't keep re-appearing.
+                Configuration.VoiceBuckets ??= new List<VoiceBucket>();
+                Configuration.VoiceBuckets.Clear();
             }
 
             foreach (var raw in voiceNames)
             {
-                var v = (raw ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(v))
+                var voice = NormalizeVoiceName(raw);
+                if (string.IsNullOrWhiteSpace(voice))
                     continue;
 
-                var bucket = GuessBucketFromVoiceFileName(v);
-                if (string.IsNullOrWhiteSpace(bucket))
-                    bucket = "default";
+                if (!Configuration.VoiceProfiles.TryGetValue(voice, out var vp) || vp == null)
+                {
+                    vp = new VoiceProfile();
+                    Configuration.VoiceProfiles[voice] = vp;
+                }
 
-                var bkt = GetOrCreateBucket(bucket);
-                bkt.Voices ??= new List<string>();
+                var suggested = AutoTagger.SuggestVoiceTagsFromFilename(voice);
+                vp.Tags ??= new List<string>();
+                foreach (var t in suggested)
+                    TagUtil.AddTag(vp.Tags, t);
 
-                if (!bkt.Voices.Any(x => string.Equals(x, v, StringComparison.OrdinalIgnoreCase)))
-                    bkt.Voices.Add(v);
-            }
+                vp.Tags = TagUtil.NormDistinct(vp.Tags);
 
-            // De-dupe + tidy
-            foreach (var b in Configuration.VoiceBuckets)
-            {
-                if (b?.Voices == null) continue;
-
-                b.Voices = b.Voices
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
+                // If we still have no tags, keep it eligible for fallback.
+                if (vp.Tags.Count == 0)
+                    TagUtil.AddTag(vp.Tags, "default");
             }
 
             Configuration.Save();
         }
 
-        private void EnsureBucketExists(string bucketName)
-        {
-            if (string.IsNullOrWhiteSpace(bucketName))
-                return;
-
-            Configuration.VoiceBuckets ??= new List<VoiceBucket>();
-
-            if (!Configuration.VoiceBuckets.Any(b => b != null && b.Name.Equals(bucketName, StringComparison.OrdinalIgnoreCase)))
-            {
-                Configuration.VoiceBuckets.Add(new VoiceBucket
-                {
-                    Name = bucketName,
-                    Voices = new List<string>()
-                });
-            }
-        }
-
-        private VoiceBucket GetOrCreateBucket(string bucketName)
-        {
-            Configuration.VoiceBuckets ??= new List<VoiceBucket>();
-
-            var existing = Configuration.VoiceBuckets
-                .FirstOrDefault(b => b != null && b.Name.Equals(bucketName, StringComparison.OrdinalIgnoreCase));
-
-            if (existing != null)
-                return existing;
-
-            var created = new VoiceBucket
-            {
-                Name = bucketName,
-                Voices = new List<string>()
-            };
-
-            Configuration.VoiceBuckets.Add(created);
-            return created;
-        }
-
-        private static string GuessBucketFromVoiceFileName(string voiceFile)
-        {
-            var baseName = Path.GetFileNameWithoutExtension(voiceFile) ?? voiceFile;
-            var lower = (baseName ?? "").Trim().ToLowerInvariant();
-
-            if (string.IsNullOrWhiteSpace(lower))
-                return "default";
-
-            // Tokenize on non-alnum
-            var tokens = TokenSplit.Split(lower).Where(t => !string.IsNullOrWhiteSpace(t)).ToHashSet();
-
-            // Strong cues first
-            if (tokens.Contains("loporrit") || tokens.Contains("way"))
-                return "loporrit";
-
-            if (tokens.Contains("bot") || tokens.Contains("machine") || tokens.Contains("robot") || tokens.Contains("android") || tokens.Contains("mech"))
-                return "machine";
-
-            if (tokens.Contains("mon") || tokens.Contains("monster") || tokens.Contains("monsters") || tokens.Contains("beast") || tokens.Contains("creature"))
-                return "monsters";
-
-            // If you want to distinguish boy vs girl later, add stricter tags in filenames.
-            if (tokens.Contains("boy") || tokens.Contains("lad"))
-                return "boy";
-
-            if (tokens.Contains("girl") || tokens.Contains("lass"))
-                return "girl";
-
-            if (tokens.Contains("woman") || tokens.Contains("female") || tokens.Contains("lady") || tokens.Contains("miss") || tokens.Contains("madam") || tokens.Contains("mrs"))
-                return "woman";
-
-            if (tokens.Contains("male") || tokens.Contains("man") || tokens.Contains("sir") || tokens.Contains("mr") || tokens.Contains("lord"))
-                return "male";
-
-            // Soft substring fallback
-            if (lower.Contains("female") || lower.Contains("woman") || lower.Contains("lady"))
-                return "woman";
-
-            if (lower.Contains("male") || lower.Contains("man") || lower.Contains("sir"))
-                return "male";
-
-            return "default";
-        }
         // ============================================================
         // Gender detection: reflection-based Customize read
         // ============================================================
@@ -721,59 +1300,52 @@ namespace NPCVoiceMaster
                 return assigned;
             }
 
-            // 4) Bucket decision: override > ends-with-way > gender > guess > default
-            string bucketName;
+            // 4) Tag-based resolution (buckets removed)
+            var voice = ResolveVoiceByTags(npcName);
 
-            if (Configuration.NpcBucketOverrides != null &&
-                Configuration.NpcBucketOverrides.TryGetValue(npcName, out var npcBucket) &&
-                !string.IsNullOrWhiteSpace(npcBucket))
+            if (!string.IsNullOrWhiteSpace(voice))
             {
-                bucketName = npcBucket.Trim();
-                LastResolvePath = "bucket override";
+                Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                Configuration.NpcAssignedVoices[npcName] = voice;
+
+                Configuration.Save();
+
+                LastResolvePath = "tag match";
+                LastResolvedVoice = voice;
+                LastResolvedBucket = ""; // legacy field; left blank intentionally
+                return voice;
             }
-            else if (EndsWithWay(npcName))
+
+            // Final fallback: pick any NON-RESERVED enabled voice first (never silent).
+            var all = GetAllConfiguredVoices();
+            if (all.Count > 0)
             {
-                bucketName = "loporrit";
-                LastResolvePath = "endswith Way";
-            }
-            else if (TryGetNpcGenderFromMetadata(npcName, out var g))
-            {
-                bucketName = (g == 0) ? "male" : "woman";
-                LastDetectedGender = (g == 0) ? "male" : "woman";
-                LastResolvePath = "gender metadata";
-            }
-            else
-            {
-                var guessed = GuessGenderBucketFromName(npcName);
-                if (!string.IsNullOrWhiteSpace(guessed))
+                var eligible = new List<string>(all.Count);
+                foreach (var v in all)
                 {
-                    bucketName = guessed;
-                    LastDetectedGender = guessed;
-                    LastResolvePath = "name guess";
+                    if (Configuration.VoiceProfiles != null &&
+                        Configuration.VoiceProfiles.TryGetValue(v, out var vp) &&
+                        vp != null &&
+                        vp.Reserved)
+                    {
+                        continue; // reserved voices should not appear in random fallback
+                    }
+                    eligible.Add(v);
                 }
-                else
-                {
-                    bucketName = (Configuration.DefaultBucket ?? "male").Trim();
-                    LastResolvePath = "default bucket";
-                }
+
+                var pool = eligible.Count > 0 ? eligible : all; // if everything is reserved, still don't go silent
+                var pick = pool[_rng.Next(pool.Count)];
+
+                LastResolvePath = eligible.Count > 0 ? "fallback (non-reserved)" : "fallback (all reserved)";
+                LastResolvedVoice = pick;
+                LastResolvedBucket = "";
+                return pick;
             }
 
-            LastResolvedBucket = bucketName;
-
-            var bucket = Configuration.VoiceBuckets?
-                .FirstOrDefault(b => b.Name.Equals(bucketName, StringComparison.OrdinalIgnoreCase));
-
-            if (bucket == null || bucket.Voices == null || bucket.Voices.Count == 0)
-                return "";
-
-            var pick = bucket.Voices[_rng.Next(bucket.Voices.Count)];
-
-            Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            Configuration.NpcAssignedVoices[npcName] = pick;
-            Configuration.Save();
-
-            LastResolvedVoice = pick;
-            return pick;
+            LastResolvePath = "no voices";
+            LastResolvedVoice = "";
+            LastResolvedBucket = "";
+            return "";
         }
 
         private bool TryFindNamedVoiceMatch(string npcName, out string voice, out string matchKind)
@@ -824,10 +1396,103 @@ namespace NPCVoiceMaster
             return false;
         }
 
+
+        private string ResolveVoiceByTags(string npcName)
+        {
+            npcName ??= "";
+            npcName = npcName.Trim();
+
+            Configuration.NpcProfiles ??= new Dictionary<string, NpcProfile>(StringComparer.OrdinalIgnoreCase);
+            Configuration.VoiceProfiles ??= new Dictionary<string, VoiceProfile>(StringComparer.OrdinalIgnoreCase);
+
+            // Pull (or create) profile. We do NOT auto-create unless we need a default tag.
+            Configuration.NpcProfiles.TryGetValue(npcName, out var npcProfile);
+
+            var required = TagUtil.ToSet(npcProfile?.RequiredVoiceTags);
+            var preferred = TagUtil.ToSet(npcProfile?.PreferredVoiceTags);
+
+            // If NPC has no tags, apply default required tag.
+            if (required.Count == 0 && preferred.Count == 0)
+            {
+                var fallbackTag = TagUtil.Norm(Configuration.DefaultNpcTag);
+                if (string.IsNullOrWhiteSpace(fallbackTag))
+                    fallbackTag = "default";
+                required.Add(fallbackTag);
+            }
+
+            var npcTone = (npcProfile?.Tone ?? "").Trim();
+            var npcAccent = (npcProfile?.Accent ?? "").Trim();
+
+            // Score each enabled voice.
+            var bestScore = int.MinValue;
+            var best = new List<string>();
+
+            foreach (var kv in Configuration.VoiceProfiles)
+            {
+                var voiceName = (kv.Key ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(voiceName)) continue;
+
+                var vp = kv.Value;
+                if (vp == null || !vp.Enabled) continue;
+
+                var voiceTags = TagUtil.ToSet(vp.Tags);
+
+                // Required tags must all match.
+                if (required.Count > 0 && !required.All(t => voiceTags.Contains(t)))
+                    continue;
+
+                var score = 0;
+
+                // Preferred tag matches add points.
+                foreach (var t in preferred)
+                    if (voiceTags.Contains(t)) score += 2;
+
+                // Having required tags at all is a mild bonus (keeps "default" from swamping everything).
+                score += required.Count;
+
+                // Accent/tone exact match boosts.
+                if (!string.IsNullOrWhiteSpace(npcAccent) && string.Equals(npcAccent, vp.Accent, StringComparison.OrdinalIgnoreCase))
+                    score += 5;
+                if (!string.IsNullOrWhiteSpace(npcTone) && string.Equals(npcTone, vp.Tone, StringComparison.OrdinalIgnoreCase))
+                    score += 5;
+
+                // Tiny bonus for richer tagging (helps prefer well-tagged voices when tied).
+                score += Math.Min(voiceTags.Count, 6);
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best.Clear();
+                    best.Add(voiceName);
+                }
+                else if (score == bestScore)
+                {
+                    best.Add(voiceName);
+                }
+            }
+
+            if (best.Count == 0)
+                return "";
+
+            return best[_rng.Next(best.Count)];
+        }
+
         private List<string> GetAllConfiguredVoices()
         {
             var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // New system
+            if (Configuration.VoiceProfiles != null)
+            {
+                foreach (var kv in Configuration.VoiceProfiles)
+                {
+                    var name = (kv.Key ?? "").Trim();
+                    if (!string.IsNullOrWhiteSpace(name) && (kv.Value?.Enabled ?? false))
+                        set.Add(name);
+                }
+            }
+
+            // Legacy buckets (kept for backward compatibility / migration)
             if (Configuration.VoiceBuckets != null)
             {
                 foreach (var b in Configuration.VoiceBuckets)
@@ -841,6 +1506,7 @@ namespace NPCVoiceMaster
                 }
             }
 
+            // Exact overrides
             if (Configuration.NpcExactVoiceOverrides != null)
             {
                 foreach (var o in Configuration.NpcExactVoiceOverrides)

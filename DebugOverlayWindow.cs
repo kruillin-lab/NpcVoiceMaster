@@ -30,7 +30,7 @@ namespace NPCVoiceMaster
             ImGui.Separator();
 
             DrawRow("Gender", _plugin.LastDetectedGender);
-            DrawRow("Bucket", _plugin.LastResolvedBucket);
+            DrawRow("Tags/Group", _plugin.LastResolvedBucket);
             DrawRow("Voice", _plugin.LastResolvedVoice);
             DrawRow("Resolve Path", _plugin.LastResolvePath);
 
