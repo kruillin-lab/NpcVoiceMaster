@@ -35,7 +35,13 @@ namespace NPCVoiceMaster
 
                 using var ms = new MemoryStream(wavBytes, writable: false);
                 using var reader = new WaveFileReader(ms);
-                using var output = new WaveOutEvent();
+                // Reduce playback latency to minimize initial buffering noise.
+                using var output = new WaveOutEvent
+                {
+                    // Reduce buffer count and latency to minimize perceived delay at start.
+                    DesiredLatency = 50,
+                    NumberOfBuffers = 2
+                };
 
                 var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
