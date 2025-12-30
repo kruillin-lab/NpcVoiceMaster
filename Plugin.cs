@@ -89,6 +89,12 @@ private readonly IDalamudPluginInterface _pi;
         public string LastTalkKey { get; private set; } = "";
         public DateTime LastTalkAt { get; private set; } = DateTime.MinValue;
 
+        // Tracks the most recently queued NPC dialogue to prevent repetitive playback of the same
+        // line. Only NPC dialogue (not player dialogue) updates these fields. Player dialogue
+        // bypasses duplicate suppression so a user can repeat themselves.
+        private string _lastQueuedNpc = "";
+        private string _lastQueuedLine = "";
+
         // New NPC suggestion popup state
         private bool _newNpcPopupOpen = false;
         private string _newNpcPopupName = "";
@@ -1231,8 +1237,41 @@ private void SetBucketForCurrentTarget(string bucketName)
                 if (string.IsNullOrWhiteSpace(line))
                     return;
 
-                // Previously, repeated identical lines were suppressed to avoid duplicate playback.
-                // This behaviour has been removed so that the same line can be spoken consecutively if desired.
+                // Determine if this line originates from the local player or is tagged as a player. Player
+                // dialogue should bypass duplicate suppression so that the same line can be spoken
+                // consecutively. NPC dialogue will be suppressed if it matches the previously queued
+                // line.
+                bool isPlayerLine = false;
+                var localName = Svc.Objects.LocalPlayer?.Name?.TextValue ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(localName) && string.Equals(localName.Trim(), npc, StringComparison.OrdinalIgnoreCase))
+                {
+                    isPlayerLine = true;
+                }
+                else if (string.Equals(npc, "Unknown", StringComparison.OrdinalIgnoreCase))
+                {
+                    isPlayerLine = true;
+                }
+                else if (Configuration.NpcProfiles != null && Configuration.NpcProfiles.TryGetValue(npc, out var prof) && prof != null)
+                {
+                    var reqSet = TagUtil.ToSet(prof.RequiredVoiceTags);
+                    var prefSet = TagUtil.ToSet(prof.PreferredVoiceTags);
+                    if (reqSet.Contains("pc") || prefSet.Contains("pc"))
+                    {
+                        isPlayerLine = true;
+                    }
+                }
+
+                if (!isPlayerLine)
+                {
+                    // Suppress duplicate NPC lines. If the current NPC and line match the last queued
+                    // values, do not queue again. Otherwise update the last queued values.
+                    if (npc == _lastQueuedNpc && line == _lastQueuedLine)
+                        return;
+
+                    _lastQueuedNpc = npc;
+                    _lastQueuedLine = line;
+                }
+
                 _ = SpeakTalkLineQueuedAsync(string.IsNullOrWhiteSpace(npc) ? "Unknown" : npc, line);
             }
             catch (Exception ex)
