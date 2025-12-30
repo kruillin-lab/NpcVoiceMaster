@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.Addon.Lifecycle;
+using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.ClientState.Objects.Types;
@@ -73,6 +73,8 @@ private readonly IDalamudPluginInterface _pi;
         private string _newNpcPopupName = "";
         private NpcProfile? _newNpcPopupProfile = null;
         private bool _tagPopupManual = false;
+        private string _newNpcPopupVoiceChoice = "";
+        private bool _newNpcPopupVoiceChoiceInit = false;
 
         public string LastDetectedGender { get; private set; } = "unknown";
         public string LastResolvedBucket { get; private set; } = "";
@@ -224,6 +226,8 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
                 _newNpcPopupProfile = working;
                 _newNpcPopupOpen = true;
                 _tagPopupManual = true;
+                _newNpcPopupVoiceChoice = "";
+                _newNpcPopupVoiceChoiceInit = false;
             }
             catch
             {
@@ -322,6 +326,8 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
             _newNpcPopupProfile = profile;
             _tagPopupManual = false;
             _newNpcPopupOpen = true;
+            _newNpcPopupVoiceChoice = "";
+            _newNpcPopupVoiceChoiceInit = false;
         }
 
         private void DrawNewNpcPopup()
@@ -367,6 +373,27 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
                 if (DrawStringComboPopup("Tone", "npc_popup_tone", ref tone, tones, 260f))
                     profile.Tone = string.IsNullOrWhiteSpace(tone) ? null : tone;
 
+
+// Voice override (optional): filtered list based on the tags above.
+var voiceCandidates = GetCandidateVoicesForProfile(profile);
+
+if (!_newNpcPopupVoiceChoiceInit)
+{
+    if (TryGetExactVoiceOverride(_newNpcPopupName, out var existingVoice) && !string.IsNullOrWhiteSpace(existingVoice))
+        _newNpcPopupVoiceChoice = existingVoice;
+    else
+        _newNpcPopupVoiceChoice = "";
+
+    _newNpcPopupVoiceChoiceInit = true;
+}
+
+DrawVoiceComboPopup("Voice override (matches tags)", "npc_popup_voice", ref _newNpcPopupVoiceChoice, voiceCandidates, 420f);
+
+if (voiceCandidates.Count > 0)
+    ImGui.TextDisabled($"Matching voices: {voiceCandidates.Count}");
+else
+    ImGui.TextDisabled("No enabled voices found.");
+
                 ImGui.Spacing();
                 ImGui.Separator();
 
@@ -397,6 +424,8 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
                     Configuration.KnownNpcTags = TagUtil.NormDistinct(Configuration.KnownNpcTags);
                     Configuration.KnownAccents = TagUtil.NormDistinct(Configuration.KnownAccents ?? new List<string>());
                     Configuration.KnownTones = TagUtil.NormDistinct(Configuration.KnownTones ?? new List<string>());
+
+                    ApplyPopupVoiceOverrideNoSave(_newNpcPopupName, _newNpcPopupVoiceChoice);
                     Configuration.Save();
 
                     _newNpcPopupOpen = false;
@@ -505,6 +534,159 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
             return false;
         }
 
+
+
+
+private List<string> GetCandidateVoicesForProfile(NpcProfile profile)
+{
+    profile ??= new NpcProfile();
+
+    var req = TagUtil.NormDistinct(profile.RequiredVoiceTags ?? new List<string>());
+    var pref = TagUtil.NormDistinct(profile.PreferredVoiceTags ?? new List<string>());
+
+    var reqSet = new HashSet<string>(req, StringComparer.OrdinalIgnoreCase);
+    var prefSet = new HashSet<string>(pref, StringComparer.OrdinalIgnoreCase);
+
+    var scored = new List<(string Voice, int Score)>();
+    var strictMatches = true;
+
+    if (Configuration.VoiceProfiles == null || Configuration.VoiceProfiles.Count == 0)
+        return new List<string>();
+
+    foreach (var kv in Configuration.VoiceProfiles)
+    {
+        var voice = kv.Key;
+        var vp = kv.Value;
+        if (vp == null) continue;
+        if (!vp.Enabled) continue;
+
+        var vtags = TagUtil.NormDistinct(vp.Tags ?? new List<string>());
+        var vset = new HashSet<string>(vtags, StringComparer.OrdinalIgnoreCase);
+
+        bool ok = true;
+        foreach (var t in reqSet)
+        {
+            if (!vset.Contains(t))
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        if (!ok) continue;
+
+        int score = 0;
+
+        foreach (var t in prefSet)
+            if (vset.Contains(t))
+                score += 10;
+
+        if (!string.IsNullOrWhiteSpace(profile.Accent) &&
+            !string.IsNullOrWhiteSpace(vp.Accent) &&
+            string.Equals(profile.Accent.Trim(), vp.Accent.Trim(), StringComparison.OrdinalIgnoreCase))
+            score += 2;
+
+        if (!string.IsNullOrWhiteSpace(profile.Tone) &&
+            !string.IsNullOrWhiteSpace(vp.Tone) &&
+            string.Equals(profile.Tone.Trim(), vp.Tone.Trim(), StringComparison.OrdinalIgnoreCase))
+            score += 1;
+
+        scored.Add((NormalizeVoiceName(voice), score));
+    }
+
+    if (scored.Count == 0)
+    {
+        strictMatches = false;
+
+        foreach (var kv in Configuration.VoiceProfiles)
+        {
+            var voice = kv.Key;
+            var vp = kv.Value;
+            if (vp == null) continue;
+            if (!vp.Enabled) continue;
+            scored.Add((NormalizeVoiceName(voice), 0));
+        }
+    }
+
+    var result = scored
+        .OrderByDescending(x => x.Score)
+        .ThenBy(x => x.Voice, StringComparer.OrdinalIgnoreCase)
+        .Select(x => x.Voice)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    // Store note for UI if you want it later.
+    // (We keep it local for now to avoid more state.)
+    _ = strictMatches;
+
+    return result;
+}
+
+private bool DrawVoiceComboPopup(string label, string id, ref string value, List<string> options, float width)
+{
+    ImGui.SetNextItemWidth(width);
+    var preview = string.IsNullOrWhiteSpace(value) ? "(Auto - use resolver)" : value;
+
+    if (ImGui.BeginCombo($"{label}##{id}", preview))
+    {
+        bool changed = false;
+
+        if (ImGui.Selectable("(Auto - use resolver)", string.IsNullOrWhiteSpace(value), ImGuiSelectableFlags.DontClosePopups))
+        {
+            value = "";
+            changed = true;
+        }
+
+        foreach (var o in options)
+        {
+            if (string.IsNullOrWhiteSpace(o)) continue;
+            bool sel = string.Equals(value, o, StringComparison.OrdinalIgnoreCase);
+            if (ImGui.Selectable(o, sel, ImGuiSelectableFlags.DontClosePopups))
+            {
+                value = o;
+                changed = true;
+            }
+        }
+
+        ImGui.EndCombo();
+        return changed;
+    }
+
+    return false;
+}
+
+private void ApplyPopupVoiceOverrideNoSave(string npcName, string voiceChoice)
+{
+    npcName = (npcName ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(npcName))
+        return;
+
+    voiceChoice = NormalizeVoiceName((voiceChoice ?? "").Trim());
+
+    Configuration.NpcExactVoiceOverrides ??= new List<NpcExactVoiceOverride>();
+    Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    // Remove old override entry
+    Configuration.NpcExactVoiceOverrides.RemoveAll(o =>
+        o != null && string.Equals((o.NpcKey ?? "").Trim(), npcName, StringComparison.OrdinalIgnoreCase));
+
+    if (string.IsNullOrWhiteSpace(voiceChoice))
+    {
+        // Clear sticky assignment so next talk re-resolves from tags
+        Configuration.NpcAssignedVoices.Remove(npcName);
+        return;
+    }
+
+    Configuration.NpcExactVoiceOverrides.Add(new NpcExactVoiceOverride
+    {
+        NpcKey = npcName,
+        Voice = voiceChoice,
+        Enabled = true
+    });
+
+    // Keep sticky assignment aligned so previews update immediately.
+    Configuration.NpcAssignedVoices[npcName] = voiceChoice;
+}
 
         public void SetDebugOverlayOpen(bool open)
         {

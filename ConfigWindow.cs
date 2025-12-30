@@ -1,4 +1,4 @@
-﻿using Dalamud.Bindings.ImGui;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using System;
 using System.Collections.Generic;
@@ -507,6 +507,10 @@ if (ImGui.Button($"Reserve (remove default)##vp_resbtn_{voice}"))
                 if (DrawStringCombo("Tone", $"np_tone_{npc}", ref tone, toneOptions, 260f))
                     np.Tone = string.IsNullOrWhiteSpace(tone) ? null : tone;
 
+
+// Voice override (optional): choose from voices that match this NPC's current tags.
+DrawVoiceOverrideForNpcRow(npc, np);
+
                 if (ImGui.Button($"Save##np_save_{npc}"))
                 {
                     if (!_plugin.Configuration.NpcProfiles.ContainsKey(npc))
@@ -568,13 +572,11 @@ if (ImGui.Button($"Reserve (remove default)##vp_resbtn_{voice}"))
             // "Existing tags" = anything already used in voice profiles or NPC profiles, plus reserved defaults.
             var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Reserved / common tags
-            foreach (var t in new[]
+            // Predefined tag seeds (so dropdowns never "forget" useful tags)
+            foreach (var t in DefaultTagSeeds)
             {
-                "male", "woman", "boy", "girl", "loporrit", "machine", "monsters", "default",
-            })
-            {
-                if (!string.IsNullOrWhiteSpace(t)) set.Add(t);
+                var n = TagUtil.Norm(t);
+                if (!string.IsNullOrWhiteSpace(n)) set.Add(n);
             }
 
             // Voice tags
@@ -625,6 +627,32 @@ if (ImGui.Button($"Reserve (remove default)##vp_resbtn_{voice}"))
             tags.Clear();
             tags.AddRange(norm);
         }
+
+
+
+        // Predefined tag seeds. These ensure important tags stay available in dropdowns even if you haven't used them yet.
+        // Keep these normalized (lowercase, underscores) because TagUtil.Norm() will normalize user input the same way.
+        private static readonly string[] DefaultTagSeeds = new[]
+        {
+            // Former buckets / common
+            "male", "woman", "boy", "girl", "loporrit", "machine", "monsters", "default",
+
+            // Monster sizing / general categories
+            "big_monster", "little_monster", "humanoid", "beast", "dragon", "voidsent",
+
+            // Playable races + tribes/clans (common NPC identifiers too)
+            "hyur", "midlander", "highlander",
+            "elezen", "wildwood", "duskwight",
+            "lalafell", "plainsfolk", "dunesfolk",
+            "miqote", "seeker_of_the_sun", "keeper_of_the_moon",
+            "roegadyn", "sea_wolf", "hellsguard",
+            "au_ra", "raen", "xaela",
+            "viera", "rava", "veena",
+            "hrothgar", "helions", "the_lost",
+
+            // Common NPC-only identities (optional but handy)
+            "garlean", "padjal",
+        };
 
         // Predefined tone/accent packs (dropdown options). These are just seeds; the dropdown also includes any values
         // already used in your NPC/Voice profiles.
@@ -795,6 +823,221 @@ bool DrawTagMultiSelectCombo(string label, string id, List<string>? selectedTags
             // NOTE: caller owns assigning back to the model.
             return changed;
         }
+
+
+// ------------------------------------------------------------
+// Voice override UI (filtered by current tags)
+// ------------------------------------------------------------
+
+private void DrawVoiceOverrideForNpcRow(string npcName, NpcProfile np)
+{
+    npcName = (npcName ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(npcName))
+        return;
+
+    np ??= new NpcProfile();
+
+    var candidates = BuildVoiceCandidatesForNpc(np, out var strictMatches);
+    var currentOverride = GetExactOverrideVoice(npcName);
+
+    ImGui.TextUnformatted("Voice override (optional)");
+    var preview = string.IsNullOrWhiteSpace(currentOverride) ? "(Auto - use resolver)" : currentOverride;
+
+    ImGui.SetNextItemWidth(420f);
+    if (ImGui.BeginCombo($"Voice (matches tags)##np_voice_{npcName}", preview))
+    {
+        if (ImGui.Selectable($"(Auto - use resolver)##np_voice_auto_{npcName}", string.IsNullOrWhiteSpace(currentOverride)))
+        {
+            SetExactOverrideVoice(npcName, "");
+            currentOverride = "";
+        }
+
+        foreach (var v in candidates)
+        {
+            var selected = string.Equals(currentOverride, v, StringComparison.OrdinalIgnoreCase);
+            var vid = MakeSafeId(v);
+            if (ImGui.Selectable($"{v}##np_voice_{npcName}_{vid}", selected))
+            {
+                SetExactOverrideVoice(npcName, v);
+                currentOverride = v;
+            }
+        }
+
+        ImGui.EndCombo();
+    }
+
+    ImGui.SameLine();
+    if (ImGui.Button($"Clear override##np_voice_clear_{npcName}"))
+    {
+        SetExactOverrideVoice(npcName, "");
+    }
+
+    if (candidates.Count == 0)
+    {
+        ImGui.TextDisabled("No enabled voices found.");
+    }
+    else if (!strictMatches)
+    {
+        ImGui.TextDisabled($"No voices match REQUIRED tags; showing all enabled voices ({candidates.Count}).");
+    }
+    else
+    {
+        ImGui.TextDisabled($"Matching voices: {candidates.Count}");
+    }
+}
+
+private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, out bool strictMatches)
+{
+    strictMatches = true;
+
+    var req = TagUtil.NormDistinct(np.RequiredVoiceTags ?? new List<string>());
+    var pref = TagUtil.NormDistinct(np.PreferredVoiceTags ?? new List<string>());
+
+    var reqSet = new HashSet<string>(req, StringComparer.OrdinalIgnoreCase);
+    var prefSet = new HashSet<string>(pref, StringComparer.OrdinalIgnoreCase);
+
+    var scored = new List<(string Voice, int Score)>();
+
+    if (_plugin.Configuration.VoiceProfiles == null || _plugin.Configuration.VoiceProfiles.Count == 0)
+        return new List<string>();
+
+    foreach (var kv in _plugin.Configuration.VoiceProfiles)
+    {
+        var voice = kv.Key;
+        var vp = kv.Value;
+        if (vp == null) continue;
+        if (!vp.Enabled) continue;
+
+        var vtags = TagUtil.NormDistinct(vp.Tags ?? new List<string>());
+        var vset = new HashSet<string>(vtags, StringComparer.OrdinalIgnoreCase);
+
+        bool ok = true;
+        foreach (var t in reqSet)
+        {
+            if (!vset.Contains(t))
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        if (!ok) continue;
+
+        int score = 0;
+
+        foreach (var t in prefSet)
+            if (vset.Contains(t))
+                score += 10;
+
+        if (!string.IsNullOrWhiteSpace(np.Accent) &&
+            !string.IsNullOrWhiteSpace(vp.Accent) &&
+            string.Equals(np.Accent.Trim(), vp.Accent.Trim(), StringComparison.OrdinalIgnoreCase))
+            score += 2;
+
+        if (!string.IsNullOrWhiteSpace(np.Tone) &&
+            !string.IsNullOrWhiteSpace(vp.Tone) &&
+            string.Equals(np.Tone.Trim(), vp.Tone.Trim(), StringComparison.OrdinalIgnoreCase))
+            score += 1;
+
+        scored.Add((voice, score));
+    }
+
+    if (scored.Count == 0)
+    {
+        // If required tags are too strict, fall back to all enabled voices so you can still pick something.
+        strictMatches = false;
+
+        foreach (var kv in _plugin.Configuration.VoiceProfiles)
+        {
+            var voice = kv.Key;
+            var vp = kv.Value;
+            if (vp == null) continue;
+            if (!vp.Enabled) continue;
+            scored.Add((voice, 0));
+        }
+    }
+
+    return scored
+        .OrderByDescending(x => x.Score)
+        .ThenBy(x => x.Voice, StringComparer.OrdinalIgnoreCase)
+        .Select(x => x.Voice)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+private string GetExactOverrideVoice(string npcName)
+{
+    npcName = (npcName ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(npcName))
+        return "";
+
+    var list = _plugin.Configuration.NpcExactVoiceOverrides;
+    if (list == null) return "";
+
+    foreach (var o in list)
+    {
+        if (o == null) continue;
+        if (!o.Enabled) continue;
+
+        var key = (o.NpcKey ?? "").Trim();
+        if (string.Equals(key, npcName, StringComparison.OrdinalIgnoreCase))
+            return (o.Voice ?? "").Trim();
+    }
+
+    return "";
+}
+
+private void SetExactOverrideVoice(string npcName, string voice)
+{
+    npcName = (npcName ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(npcName))
+        return;
+
+    voice = _plugin.NormalizeVoiceName((voice ?? "").Trim());
+
+    _plugin.Configuration.NpcExactVoiceOverrides ??= new List<NpcExactVoiceOverride>();
+    _plugin.Configuration.NpcAssignedVoices ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    // Remove old entry (we'll re-add if needed)
+    _plugin.Configuration.NpcExactVoiceOverrides.RemoveAll(o =>
+        o != null && string.Equals((o.NpcKey ?? "").Trim(), npcName, StringComparison.OrdinalIgnoreCase));
+
+    if (string.IsNullOrWhiteSpace(voice))
+    {
+        // Clear override + clear sticky assignment to re-resolve
+        _plugin.Configuration.NpcAssignedVoices.Remove(npcName);
+        _plugin.Configuration.Save();
+        _status = $"Cleared voice override: {npcName}";
+        return;
+    }
+
+    _plugin.Configuration.NpcExactVoiceOverrides.Add(new NpcExactVoiceOverride
+    {
+        NpcKey = npcName,
+        Voice = voice,
+        Enabled = true
+    });
+
+    // Keep sticky assignment aligned so previews update immediately.
+    _plugin.Configuration.NpcAssignedVoices[npcName] = voice;
+
+    _plugin.Configuration.Save();
+    _status = $"Set voice override: {npcName} -> {voice}";
+}
+
+private static string MakeSafeId(string s)
+{
+    s ??= "";
+    var sb = new System.Text.StringBuilder(s.Length);
+    foreach (var ch in s)
+    {
+        if (char.IsLetterOrDigit(ch))
+            sb.Append(ch);
+        else
+            sb.Append('_');
+    }
+    return sb.ToString();
+}
 
 private void AutoTagAllVoices()
         {
