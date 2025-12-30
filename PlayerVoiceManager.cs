@@ -11,12 +11,36 @@ public class PlayerVoiceManager
     // are treated the same regardless of capitalization.
     private Dictionary<string, string> playerVoices;
 
-    public PlayerVoiceManager(string filePath)
-    {
-        this.filePath = filePath;
-        // Initialize the dictionary with loaded values and ensure case-insensitive lookup
-        this.playerVoices = LoadPlayerVoices();
-    }
+        public PlayerVoiceManager(string filePath)
+        {
+            this.filePath = filePath;
+            // Initialize the dictionary with loaded values and ensure case-insensitive lookup.
+            // When loading from disk, normalize all player names to "First Last" (ignoring server
+            // names) so that assignments are independent of a player's world/server. This makes it
+            // unnecessary to include the server name when assigning a voice.
+            var loaded = LoadPlayerVoices();
+            this.playerVoices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in loaded)
+            {
+                var norm = NormalizeName(kv.Key);
+                this.playerVoices[norm] = kv.Value;
+            }
+        }
+
+        /// <summary>
+        /// Normalize a character name by stripping any server/world component. Input names are
+        /// expected to be either "First Last" or "First Last Server"; this method returns
+        /// "First Last" in both cases. Names are trimmed and multiple spaces are collapsed.
+        /// </summary>
+        private static string NormalizeName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "";
+            var parts = name.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            // If there are at least two parts, return the first and second (first and last name).
+            if (parts.Length >= 2)
+                return parts[0] + " " + parts[1];
+            return parts[0];
+        }
 
     /// <summary>
     /// Returns a copy of all current player voice assignments. A new dictionary is returned to
@@ -56,9 +80,9 @@ public class PlayerVoiceManager
     {
         // Return null if playerName is null or empty
         if (string.IsNullOrWhiteSpace(playerName)) return null;
-
-        // Try to retrieve the voice assignment; return null if not found
-        return playerVoices.TryGetValue(playerName, out var voice) ? voice : null;
+        var norm = NormalizeName(playerName);
+        // Try to retrieve the voice assignment using the normalized name; return null if not found
+        return playerVoices.TryGetValue(norm, out var voice) ? voice : null;
     }
 
     // Assign a voice to a player
@@ -66,13 +90,14 @@ public class PlayerVoiceManager
     {
         if (!string.IsNullOrEmpty(playerName) && !string.IsNullOrEmpty(voiceFile))
         {
-            if (!playerVoices.ContainsKey(playerName))
+            var norm = NormalizeName(playerName);
+            if (!playerVoices.ContainsKey(norm))
             {
-                playerVoices.Add(playerName, voiceFile);
+                playerVoices.Add(norm, voiceFile);
             }
             else
             {
-                playerVoices[playerName] = voiceFile;
+                playerVoices[norm] = voiceFile;
             }
             SavePlayerVoices(); // Save the updated voices
         }
@@ -81,9 +106,10 @@ public class PlayerVoiceManager
     // Remove the voice assignment for a player
     public void RemoveVoiceFromPlayer(string playerName)
     {
-        if (playerVoices.ContainsKey(playerName))
+        var norm = NormalizeName(playerName);
+        if (playerVoices.ContainsKey(norm))
         {
-            playerVoices.Remove(playerName);
+            playerVoices.Remove(norm);
             SavePlayerVoices(); // Save the updated voices
         }
     }

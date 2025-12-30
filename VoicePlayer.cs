@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -38,8 +38,9 @@ namespace NPCVoiceMaster
                 // Reduce playback latency to minimize initial buffering noise.
                 using var output = new WaveOutEvent
                 {
-                    // Adjust buffer count and latency. A larger DesiredLatency (ms) can reduce underruns at the cost of a small delay.
-                    DesiredLatency = 150,
+                    // Tune playback latency to reduce initial buffering noise. Lower values reduce the startup delay but may risk
+                    // underruns on slow systems. Adjust as necessary (e.g., 75–100 ms) to balance latency and stability.
+                    DesiredLatency = 75,
                     NumberOfBuffers = 2
                 };
 

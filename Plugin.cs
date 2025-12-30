@@ -1329,61 +1329,80 @@ private void SetBucketForCurrentTarget(string bucketName)
 
         private async Task SpeakTalkLineQueuedAsync(string npcName, string lineText)
         {
-            // Serialize TTS generation so we don't overload AllTalk with concurrent requests.
+            // Resolve the voice for this NPC (or player). If no voice can be resolved, skip playback.
+            var voice = ResolveVoiceForNpc(npcName);
+            if (string.IsNullOrWhiteSpace(voice))
+                return;
+
+            // Determine if this line originates from the local player or is tagged as a player. Player lines
+            // should bypass the global speak queue to allow immediate repetition and concurrency. Treat
+            // "Unknown" NPC names as player speech for caching and concurrency purposes.
+            var localPlayerName = Svc.Objects.LocalPlayer?.Name?.TextValue ?? "";
+            var isPlayerNameMatch = !string.IsNullOrWhiteSpace(localPlayerName) &&
+                           string.Equals(localPlayerName.Trim(), npcName, StringComparison.OrdinalIgnoreCase);
+
+            // Check if this NPC has been manually tagged as a player ("pc") in its profile. A pc tag on either
+            // required or preferred voice-tags indicates that the user wants this character treated as a player.
+            bool isTaggedPlayer = false;
+            if (Configuration.NpcProfiles != null &&
+                Configuration.NpcProfiles.TryGetValue(npcName, out var np) &&
+                np != null)
+            {
+                var reqSet = TagUtil.ToSet(np.RequiredVoiceTags);
+                var prefSet = TagUtil.ToSet(np.PreferredVoiceTags);
+                isTaggedPlayer = reqSet.Contains("pc") || prefSet.Contains("pc");
+            }
+
+            // Treat "Unknown" names the same as players for caching and concurrency.
+            var treatAsPlayer = isPlayerNameMatch || isTaggedPlayer || string.Equals(npcName, "Unknown", StringComparison.OrdinalIgnoreCase);
+
+            // If this is player dialogue, generate audio without entering the global queue. Disable caching so that
+            // repeated lines always generate fresh audio. Player caches (for previews) are always stored in the
+            // __player folder for auto-cleanup.
+            if (treatAsPlayer)
+            {
+                try
+                {
+                    var audio = await GetOrCreateCachedTtsAsync(npcName, lineText, voice, useCache: false, isPlayerCache: true);
+                    if (audio != null && audio.Length > 0)
+                    {
+                        _player.PlayAudio(audio);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync player playback failed.");
+                }
+                return;
+            }
+
+            // For NPC dialogue, serialize TTS generation using the global queue to avoid overloading AllTalk. Use
+            // caching to avoid repeated TTS requests for the same line and voice. NPC caches are stored under
+            // their NPC name.
             await _speakQueue.WaitAsync();
-            byte[]? audio = null;
+            byte[]? audioBuf = null;
             try
             {
-                var voice = ResolveVoiceForNpc(npcName);
-                if (string.IsNullOrWhiteSpace(voice))
-                    return;
-
-                // Determine if this line originates from the local player. A line is considered player-controlled if
-                // the NPC name matches the local player's character name (case-insensitive) or if the NPC name is
-                // "Unknown" (used as a fallback when no name is detected). For player lines, disable caching so the
-                // line can be repeated immediately without reusing the cached audio. When not a player line, caching
-                // is enabled to avoid redundant TTS requests.
-                var localPlayerName = Svc.Objects.LocalPlayer?.Name?.TextValue ?? "";
-                var isPlayerNameMatch = !string.IsNullOrWhiteSpace(localPlayerName) &&
-                               string.Equals(localPlayerName.Trim(), npcName, StringComparison.OrdinalIgnoreCase);
-
-                // Check if this NPC has been manually tagged as a player ("pc") in its profile. A pc tag on either
-                // required or preferred voice-tags indicates that the user wants this character treated as a player for
-                // caching and cleanup purposes.
-                bool isTaggedPlayer = false;
-                if (Configuration.NpcProfiles != null &&
-                    Configuration.NpcProfiles.TryGetValue(npcName, out var np) &&
-                    np != null)
-                {
-                    var reqSet = TagUtil.ToSet(np.RequiredVoiceTags);
-                    var prefSet = TagUtil.ToSet(np.PreferredVoiceTags);
-                    isTaggedPlayer = reqSet.Contains("pc") || prefSet.Contains("pc");
-                }
-
-                var isPlayer = isPlayerNameMatch || isTaggedPlayer;
-                var isPlayerCache = isPlayer || string.Equals(npcName, "Unknown", StringComparison.OrdinalIgnoreCase);
-                var useCache = !isPlayer;
-                audio = await GetOrCreateCachedTtsAsync(npcName, lineText, voice, useCache: useCache, isPlayerCache: isPlayerCache);
+                audioBuf = await GetOrCreateCachedTtsAsync(npcName, lineText, voice, useCache: true, isPlayerCache: false);
             }
             catch (Exception ex)
             {
-                Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync failed.");
+                Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync NPC failed.");
             }
             finally
             {
                 _speakQueue.Release();
             }
 
-            // Play the audio outside of the semaphore to avoid blocking subsequent lines from queuing.
-            if (audio != null && audio.Length > 0)
+            if (audioBuf != null && audioBuf.Length > 0)
             {
                 try
                 {
-                    _player.PlayAudio(audio);
+                    _player.PlayAudio(audioBuf);
                 }
                 catch (Exception ex)
                 {
-                    Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync playback failed.");
+                    Svc.Log.Error(ex, "[NpcVoiceMaster] SpeakTalkLineQueuedAsync NPC playback failed.");
                 }
             }
         }
