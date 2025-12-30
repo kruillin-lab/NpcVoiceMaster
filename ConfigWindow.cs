@@ -22,12 +22,14 @@ namespace NPCVoiceMaster
 
         // Tag UI state
         private string _voiceSearch = "";
+        private string _voiceTestLine = "Thirty-three thieves thought they thrilled the throne throughout Thursday.";
         private string _npcSearch = "";
 
 
         // Per-combo filter text (for multi-select tag dropdowns)
         private readonly Dictionary<string, string> _tagFilter = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _stringFilter = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, bool> _voiceOverrideShowAllAccents = new(StringComparer.OrdinalIgnoreCase);
         private bool _fetchClearFirst = false;
 
         private string _newNpcName = "";
@@ -231,6 +233,38 @@ namespace NPCVoiceMaster
             }
         }
 
+        private static readonly string[] AccentQuickSet = new[]
+        {
+            "american", "british", "cockney", "irish", "scottish", "indian"
+        };
+
+        private void DrawAccentQuickButtonsForVoice(string voiceName, VoiceProfile vp)
+        {
+            // Compact one-click accent buttons for fast casting/tagging.
+            // Cockney is treated as a distinct accent here; matching logic can handle cockney ⊂ british.
+            for (var i = 0; i < AccentQuickSet.Length; i++)
+            {
+                var acc = AccentQuickSet[i];
+
+                if (i > 0) ImGui.SameLine();
+
+                if (ImGui.SmallButton($"{acc}##vp_accbtn_{voiceName}_{acc}"))
+                {
+                    vp.Accent = acc;
+                    _plugin.Configuration.Save();
+                    _status = $"Set accent '{acc}' for voice: {voiceName}";
+                }
+            }
+
+            ImGui.SameLine();
+            if (ImGui.SmallButton($"Clear##vp_accbtn_{voiceName}_clear"))
+            {
+                vp.Accent = null;
+                _plugin.Configuration.Save();
+                _status = $"Cleared accent for voice: {voiceName}";
+            }
+        }
+
         private void DrawTab_Cache()
         {
             ImGui.TextUnformatted("Cache Folder Override (blank = default plugin cache folder)");
@@ -276,8 +310,15 @@ namespace NPCVoiceMaster
                 AutoTagFilteredVoices();
             }
 
-            ImGui.Separator();
+            
+// Voice audition
+ImGui.TextUnformatted("Audition: use a consistent test line when tagging accents.");
+ImGui.SetNextItemWidth(760);
+ImGui.InputTextWithHint("##voice_test_line", "Voice audition test line...", ref _voiceTestLine, 1024);
+if (string.IsNullOrWhiteSpace(_voiceTestLine))
+    _voiceTestLine = "Thirty-three thieves thought they thrilled the throne throughout Thursday.";
 
+ImGui.Separator();
             var voices = _plugin.Configuration.VoiceProfiles
                 .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                 .Select(kv => kv.Key)
@@ -307,6 +348,18 @@ namespace NPCVoiceMaster
                     _status = $"Saved voice: {voice}";
                 }
 
+
+
+ImGui.SameLine();
+if (ImGui.Button($"Preview##vp_prev_{voice}"))
+{
+    _plugin.PreviewVoice(voice, _voiceTestLine);
+    _status = $"Previewing: {voice}";
+}
+
+// Quick accent tagging
+ImGui.TextUnformatted("Quick accent:");
+DrawAccentQuickButtonsForVoice(voice, vp);
 
 var reserved = vp.Reserved;
 if (ImGui.Checkbox($"Reserved (exclude from fallback)##vp_res_{voice}", ref reserved))
@@ -658,8 +711,12 @@ DrawVoiceOverrideForNpcRow(npc, np);
         // already used in your NPC/Voice profiles.
         private static readonly string[] DefaultAccents = new[]
         {
-            "", "us", "uk", "irish", "scottish", "welsh", "australian", "new_zealand", "canadian",
-            "south_african", "indian", "jamaican"
+            "",
+            // Accent roster (canonical)
+            "american", "british", "cockney", "irish", "scottish", "indian",
+
+            // Legacy/aliases (kept for compatibility with older configs)
+            "us", "uk"
         };
 
         private static readonly string[] DefaultTones = new[]
@@ -667,6 +724,39 @@ DrawVoiceOverrideForNpcRow(npc, np);
             "", "neutral", "warm", "cold", "cheerful", "serious", "calm", "sleepy", "whispery",
             "gruff", "old", "young", "posh", "rough", "robotic"
         };
+
+        private static string CanonAccent(string? s)
+        {
+            s = (s ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(s))
+                return "";
+
+            return s switch
+            {
+                "us" or "usa" or "american" or "america" => "american",
+                "uk" or "british" or "english" or "england" => "british",
+                "cockney" => "cockney",
+                "irish" or "ireland" => "irish",
+                "scottish" or "scotland" => "scottish",
+                "indian" or "india" => "indian",
+                _ => s
+            };
+        }
+
+        private static bool AccentMatches(string npcAccentCanon, string voiceAccentCanon)
+        {
+            if (string.IsNullOrWhiteSpace(npcAccentCanon) || string.IsNullOrWhiteSpace(voiceAccentCanon))
+                return false;
+
+            if (npcAccentCanon == "british")
+                return voiceAccentCanon == "british" || voiceAccentCanon == "cockney";
+
+            if (npcAccentCanon == "cockney")
+                return voiceAccentCanon == "cockney";
+
+            return string.Equals(npcAccentCanon, voiceAccentCanon, StringComparison.OrdinalIgnoreCase);
+        }
+
 
         private List<string> BuildStringOptions(IEnumerable<string> defaults, Configuration cfg, bool includeNpc, bool includeVoices, string currentValue, bool isAccent)
         {
@@ -828,7 +918,6 @@ bool DrawTagMultiSelectCombo(string label, string id, List<string>? selectedTags
 // ------------------------------------------------------------
 // Voice override UI (filtered by current tags)
 // ------------------------------------------------------------
-
 private void DrawVoiceOverrideForNpcRow(string npcName, NpcProfile np)
 {
     npcName = (npcName ?? "").Trim();
@@ -837,14 +926,32 @@ private void DrawVoiceOverrideForNpcRow(string npcName, NpcProfile np)
 
     np ??= new NpcProfile();
 
-    var candidates = BuildVoiceCandidatesForNpc(np, out var strictMatches);
-    var currentOverride = GetExactOverrideVoice(npcName);
+    _voiceOverrideShowAllAccents.TryGetValue(npcName, out var showAllAccents);
+    var npcAccentCanon = CanonAccent(np.Accent);
 
     ImGui.TextUnformatted("Voice override (optional)");
+
+    if (!string.IsNullOrWhiteSpace(npcAccentCanon))
+    {
+        if (ImGui.Checkbox($"Show all accents##np_voice_allacc_{npcName}", ref showAllAccents))
+            _voiceOverrideShowAllAccents[npcName] = showAllAccents;
+
+        ImGui.SameLine();
+        ImGui.TextDisabled($"NPC accent: {npcAccentCanon}");
+    }
+    else
+    {
+        // Keep state keyed by NPC name; harmless even when no accent is set.
+        _voiceOverrideShowAllAccents[npcName] = showAllAccents;
+    }
+
+    var candidates = BuildVoiceCandidatesForNpc(np, showAllAccents, out var strictMatches, out var accentFiltered);
+    var currentOverride = GetExactOverrideVoice(npcName);
+
     var preview = string.IsNullOrWhiteSpace(currentOverride) ? "(Auto - use resolver)" : currentOverride;
 
     ImGui.SetNextItemWidth(420f);
-    if (ImGui.BeginCombo($"Voice (matches tags)##np_voice_{npcName}", preview))
+    if (ImGui.BeginCombo($"Voice (matches tags + accent)##np_voice_{npcName}", preview))
     {
         if (ImGui.Selectable($"(Auto - use resolver)##np_voice_auto_{npcName}", string.IsNullOrWhiteSpace(currentOverride)))
         {
@@ -875,20 +982,33 @@ private void DrawVoiceOverrideForNpcRow(string npcName, NpcProfile np)
     if (candidates.Count == 0)
     {
         ImGui.TextDisabled("No enabled voices found.");
+        return;
     }
-    else if (!strictMatches)
+
+    if (!strictMatches)
     {
         ImGui.TextDisabled($"No voices match REQUIRED tags; showing all enabled voices ({candidates.Count}).");
+        return;
     }
-    else
+
+    if (!string.IsNullOrWhiteSpace(npcAccentCanon) && !showAllAccents)
     {
-        ImGui.TextDisabled($"Matching voices: {candidates.Count}");
+        if (accentFiltered)
+            ImGui.TextDisabled($"Showing voices matching REQUIRED tags + accent ({candidates.Count}).");
+        else
+            ImGui.TextDisabled($"No voices match accent '{npcAccentCanon}'; showing REQUIRED-tag matches ({candidates.Count}).");
+        return;
     }
+
+    ImGui.TextDisabled($"Matching voices: {candidates.Count}");
 }
 
-private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, out bool strictMatches)
+private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, bool showAllAccents, out bool strictMatches, out bool accentFiltered)
 {
     strictMatches = true;
+    accentFiltered = false;
+
+    np ??= new NpcProfile();
 
     var req = TagUtil.NormDistinct(np.RequiredVoiceTags ?? new List<string>());
     var pref = TagUtil.NormDistinct(np.PreferredVoiceTags ?? new List<string>());
@@ -896,11 +1016,14 @@ private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, out bool strictMa
     var reqSet = new HashSet<string>(req, StringComparer.OrdinalIgnoreCase);
     var prefSet = new HashSet<string>(pref, StringComparer.OrdinalIgnoreCase);
 
-    var scored = new List<(string Voice, int Score)>();
+    var npcAccentCanon = CanonAccent(np.Accent);
+
+    var scored = new List<(string Voice, int Score, bool AccentMatch)>();
 
     if (_plugin.Configuration.VoiceProfiles == null || _plugin.Configuration.VoiceProfiles.Count == 0)
         return new List<string>();
 
+    // 1) Strict pool: voices that satisfy REQUIRED tags.
     foreach (var kv in _plugin.Configuration.VoiceProfiles)
     {
         var voice = kv.Key;
@@ -923,28 +1046,24 @@ private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, out bool strictMa
 
         if (!ok) continue;
 
+        var voiceAccentCanon = CanonAccent(vp.Accent);
+        var accentMatch = !string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon);
+
         int score = 0;
 
         foreach (var t in prefSet)
             if (vset.Contains(t))
                 score += 10;
 
-        if (!string.IsNullOrWhiteSpace(np.Accent) &&
-            !string.IsNullOrWhiteSpace(vp.Accent) &&
-            string.Equals(np.Accent.Trim(), vp.Accent.Trim(), StringComparison.OrdinalIgnoreCase))
-            score += 2;
+        // Accent is the big signal (tone intentionally ignored).
+        if (accentMatch) score += 100;
 
-        if (!string.IsNullOrWhiteSpace(np.Tone) &&
-            !string.IsNullOrWhiteSpace(vp.Tone) &&
-            string.Equals(np.Tone.Trim(), vp.Tone.Trim(), StringComparison.OrdinalIgnoreCase))
-            score += 1;
-
-        scored.Add((voice, score));
+        scored.Add((voice, score, accentMatch));
     }
 
+    // 2) If required tags are too strict, fall back to all enabled voices so you can still pick something.
     if (scored.Count == 0)
     {
-        // If required tags are too strict, fall back to all enabled voices so you can still pick something.
         strictMatches = false;
 
         foreach (var kv in _plugin.Configuration.VoiceProfiles)
@@ -953,11 +1072,28 @@ private List<string> BuildVoiceCandidatesForNpc(NpcProfile np, out bool strictMa
             var vp = kv.Value;
             if (vp == null) continue;
             if (!vp.Enabled) continue;
-            scored.Add((voice, 0));
+
+            var voiceAccentCanon = CanonAccent(vp.Accent);
+            var accentMatch = !string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon);
+
+            var score = accentMatch ? 100 : 0;
+            scored.Add((voice, score, accentMatch));
         }
     }
 
-    return scored
+    // 3) Accent filtering (optional): if NPC has an accent and at least one voice matches, restrict to those.
+    var pool = scored;
+    if (!showAllAccents && !string.IsNullOrWhiteSpace(npcAccentCanon))
+    {
+        var accentOnly = scored.Where(x => x.AccentMatch).ToList();
+        if (accentOnly.Count > 0)
+        {
+            pool = accentOnly;
+            accentFiltered = true;
+        }
+    }
+
+    return pool
         .OrderByDescending(x => x.Score)
         .ThenBy(x => x.Voice, StringComparer.OrdinalIgnoreCase)
         .Select(x => x.Voice)

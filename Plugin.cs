@@ -76,6 +76,11 @@ private readonly IDalamudPluginInterface _pi;
         private string _newNpcPopupVoiceChoice = "";
         private bool _newNpcPopupVoiceChoiceInit = false;
 
+// Voice audition preview (stop previous preview on new preview)
+private readonly object _previewSync = new object();
+private System.Threading.CancellationTokenSource? _previewCts = null;
+private System.Threading.Tasks.Task? _previewTask = null;
+
         public string LastDetectedGender { get; private set; } = "unknown";
         public string LastResolvedBucket { get; private set; } = "";
         public string LastResolvedVoice { get; private set; } = "";
@@ -266,6 +271,87 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
 
             return "(unknown)";
         }
+
+public void PreviewVoice(string voiceName, string? testLine)
+{
+    voiceName = NormalizeVoiceName((voiceName ?? "").Trim());
+    if (string.IsNullOrWhiteSpace(voiceName))
+        return;
+
+    var line = (testLine ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(line))
+        line = "Thirty-three thieves thought they thrilled the throne throughout Thursday.";
+
+    // Keep previews out of normal NPC caching buckets
+    _ = PreviewVoiceLineQueuedAsync(voiceName, line);
+}
+
+private async Task PreviewVoiceLineQueuedAsync(string voiceName, string lineText)
+{
+    // Cancel any in-flight/playing preview so the new preview starts ASAP.
+    System.Threading.CancellationTokenSource? oldCts = null;
+    System.Threading.CancellationTokenSource newCts;
+    lock (_previewSync)
+    {
+        oldCts = _previewCts;
+        newCts = new System.Threading.CancellationTokenSource();
+        _previewCts = newCts;
+    }
+
+    try
+    {
+        oldCts?.Cancel();
+    }
+    catch { /* ignore */ }
+    finally
+    {
+        try { oldCts?.Dispose(); } catch { /* ignore */ }
+    }
+
+    var token = newCts.Token;
+
+    // Serialize TTS generation with the rest of the plugin, but do NOT block on playback.
+    await _speakQueue.WaitAsync().ConfigureAwait(false);
+    try
+    {
+        if (token.IsCancellationRequested)
+            return;
+
+        var audio = await GetOrCreateCachedTtsAsync("__VoiceTest__", lineText, voiceName).ConfigureAwait(false);
+        if (audio == null || audio.Length == 0)
+            return;
+
+        if (token.IsCancellationRequested)
+            return;
+
+        var playTask = _player.PlayAudioAsync(audio, token);
+        lock (_previewSync)
+        {
+            _previewTask = playTask;
+        }
+
+        // Fire-and-forget: swallow preview playback failures (don't crash plugin).
+        _ = playTask.ContinueWith(t =>
+        {
+            try
+            {
+                if (t.Exception != null)
+                    Svc.Log.Debug($"[NpcVoiceMaster] Preview playback ended with error: {t.Exception.GetBaseException().Message}");
+            }
+            catch { }
+        }, System.Threading.Tasks.TaskScheduler.Default);
+    }
+    catch (Exception ex)
+    {
+        Svc.Log.Error(ex, "[NpcVoiceMaster] PreviewVoiceLineQueuedAsync failed.");
+    }
+    finally
+    {
+        _speakQueue.Release();
+    }
+}
+
+
 
 
 
@@ -1579,8 +1665,49 @@ private void SetBucketForCurrentTarget(string bucketName)
         }
 
 
+        // ============================================================
+        // Accent normalization + matching
+        // ============================================================
+        private static string CanonAccent(string? s)
+        {
+            s = (s ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(s))
+                return "";
+
+            // Common aliases / legacy values
+            return s switch
+            {
+                "us" or "usa" or "american" or "america" => "american",
+                "uk" or "british" or "english" or "england" => "british",
+                "cockney" => "cockney",
+                "irish" or "ireland" => "irish",
+                "scottish" or "scotland" => "scottish",
+                "indian" or "india" => "indian",
+                _ => s
+            };
+        }
+
+        private static bool AccentMatches(string npcAccentCanon, string voiceAccentCanon)
+        {
+            if (string.IsNullOrWhiteSpace(npcAccentCanon) || string.IsNullOrWhiteSpace(voiceAccentCanon))
+                return false;
+
+            // Cockney is a subset of British:
+            // - NPC wants "british" -> accept both "british" and "cockney"
+            // - NPC wants "cockney" -> accept only "cockney"
+            if (npcAccentCanon == "british")
+                return voiceAccentCanon == "british" || voiceAccentCanon == "cockney";
+
+            if (npcAccentCanon == "cockney")
+                return voiceAccentCanon == "cockney";
+
+            return string.Equals(npcAccentCanon, voiceAccentCanon, StringComparison.OrdinalIgnoreCase);
+        }
+
+
         private string ResolveVoiceByTags(string npcName)
         {
+
             npcName ??= "";
             npcName = npcName.Trim();
 
@@ -1602,12 +1729,10 @@ private void SetBucketForCurrentTarget(string bucketName)
                 required.Add(fallbackTag);
             }
 
-            var npcTone = (npcProfile?.Tone ?? "").Trim();
-            var npcAccent = (npcProfile?.Accent ?? "").Trim();
+            var npcAccentCanon = CanonAccent(npcProfile?.Accent);
 
-            // Score each enabled voice.
-            var bestScore = int.MinValue;
-            var best = new List<string>();
+            // Score each enabled voice (tags first, accent heavily weighted).
+            var scoredAll = new List<(string Voice, int Score, string AccentCanon)>();
 
             foreach (var kv in Configuration.VoiceProfiles)
             {
@@ -1627,29 +1752,48 @@ private void SetBucketForCurrentTarget(string bucketName)
 
                 // Preferred tag matches add points.
                 foreach (var t in preferred)
-                    if (voiceTags.Contains(t)) score += 2;
+                    if (voiceTags.Contains(t)) score += 10;
 
                 // Having required tags at all is a mild bonus (keeps "default" from swamping everything).
                 score += required.Count;
 
-                // Accent/tone exact match boosts.
-                if (!string.IsNullOrWhiteSpace(npcAccent) && string.Equals(npcAccent, vp.Accent, StringComparison.OrdinalIgnoreCase))
-                    score += 5;
-                if (!string.IsNullOrWhiteSpace(npcTone) && string.Equals(npcTone, vp.Tone, StringComparison.OrdinalIgnoreCase))
-                    score += 5;
+                // Accent: BIG boost (tone intentionally ignored).
+                var voiceAccentCanon = CanonAccent(vp.Accent);
+                if (!string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon))
+                    score += 100;
 
                 // Tiny bonus for richer tagging (helps prefer well-tagged voices when tied).
                 score += Math.Min(voiceTags.Count, 6);
 
-                if (score > bestScore)
+                scoredAll.Add((voiceName, score, voiceAccentCanon));
+            }
+
+            if (scoredAll.Count == 0)
+                return "";
+
+            // Accent filtering: if NPC has an accent and at least one voice matches, restrict to those.
+            var pool = scoredAll;
+            if (!string.IsNullOrWhiteSpace(npcAccentCanon))
+            {
+                var accentPool = scoredAll.Where(x => AccentMatches(npcAccentCanon, x.AccentCanon)).ToList();
+                if (accentPool.Count > 0)
+                    pool = accentPool;
+            }
+
+            var bestScore = int.MinValue;
+            var best = new List<string>();
+
+            foreach (var x in pool)
+            {
+                if (x.Score > bestScore)
                 {
-                    bestScore = score;
+                    bestScore = x.Score;
                     best.Clear();
-                    best.Add(voiceName);
+                    best.Add(x.Voice);
                 }
-                else if (score == bestScore)
+                else if (x.Score == bestScore)
                 {
-                    best.Add(voiceName);
+                    best.Add(x.Voice);
                 }
             }
 
