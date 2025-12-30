@@ -18,6 +18,16 @@ public class PlayerVoiceManager
         this.playerVoices = LoadPlayerVoices();
     }
 
+    /// <summary>
+    /// Returns a copy of all current player voice assignments. A new dictionary is returned to
+    /// prevent callers from modifying the internal state of this manager directly. Keys are
+    /// compared using a case-insensitive comparer.
+    /// </summary>
+    public Dictionary<string, string> GetAllPlayerVoices()
+    {
+        return new Dictionary<string, string>(playerVoices, StringComparer.OrdinalIgnoreCase);
+    }
+
     // Load player voices from the JSON file
     public Dictionary<string, string> LoadPlayerVoices()
     {

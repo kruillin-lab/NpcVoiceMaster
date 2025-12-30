@@ -68,6 +68,18 @@ private readonly IDalamudPluginInterface _pi;
         /// </summary>
         private const string PlayerCacheFolder = "__player";
 
+        // PlayerVoiceManager handles voice assignments for player characters. All player voice data is stored
+        // separately from NPC configuration to allow different caching and cleanup policies. The manager
+        // persists its state in a JSON file located in the plugin's configuration directory.
+        private readonly PlayerVoiceManager _playerVoiceManager;
+
+        /// <summary>
+        /// Exposes the <see cref="PlayerVoiceManager"/> instance so other classes (e.g. the config UI) can
+        /// query and modify player voice assignments without duplicating logic. The manager provides
+        /// methods to load existing assignments, set or remove a player's voice, and save changes.
+        /// </summary>
+        public PlayerVoiceManager PlayerVoiceManager => _playerVoiceManager;
+
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> CacheLocks = new(StringComparer.OrdinalIgnoreCase);
         private static readonly Regex TokenSplit = new Regex(@"[^a-zA-Z0-9]+", RegexOptions.Compiled);
 
@@ -106,6 +118,23 @@ private System.Threading.Tasks.Task? _previewTask = null;
             _pi.Create<Svc>();
 
             Configuration = LoadConfigurationSafe();
+
+            // Initialize the PlayerVoiceManager before any voice resolution. The manager stores per-player
+            // voice assignments in a separate JSON file located in the plugin's configuration
+            // directory. If the configuration directory is unavailable or inaccessible, fall back
+            // to the user's roaming application data folder. This ensures that player voice
+            // assignments persist across sessions independently of NPC voice settings.
+            try
+            {
+                var playerConfigPath = System.IO.Path.Combine(_pi.ConfigDirectory.FullName, "player_voice_config.json");
+                _playerVoiceManager = new PlayerVoiceManager(playerConfigPath);
+            }
+            catch
+            {
+                var fallbackDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                var fallbackPath = System.IO.Path.Combine(fallbackDir, "NpcVoiceMaster_player_voice_config.json");
+                _playerVoiceManager = new PlayerVoiceManager(fallbackPath);
+            }
 
             WindowSystem = new WindowSystem("NpcVoiceMaster");
             ConfigWindow = new ConfigWindow(this);
@@ -1601,6 +1630,23 @@ private void SetBucketForCurrentTarget(string bucketName)
             LastResolvedVoice = "";
             LastDetectedGender = "unknown";
             LastResolvePath = "";
+
+            // 0) Check for player-specific voice assignment. Player voice assignments override all other
+            // resolution rules. If a player voice is found for this NPC name, return it immediately.
+            if (_playerVoiceManager != null)
+            {
+                try
+                {
+                    var playerVoice = _playerVoiceManager.GetPlayerVoice(npcName);
+                    if (!string.IsNullOrWhiteSpace(playerVoice))
+                    {
+                        LastResolvePath = "player assignment";
+                        LastResolvedVoice = playerVoice;
+                        return playerVoice;
+                    }
+                }
+                catch { /* ignore player manager errors */ }
+            }
 
             // 1) Manual exact override wins
             var ov = Configuration.NpcExactVoiceOverrides?

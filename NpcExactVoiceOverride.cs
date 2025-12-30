@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace NPCVoiceMaster // Make sure this matches your project
 {

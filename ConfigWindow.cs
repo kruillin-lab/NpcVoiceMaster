@@ -35,7 +35,10 @@ namespace NPCVoiceMaster
         private string _newNpcName = "";
         private string _newNpcRequiredTags = "";
         private string _newNpcPreferredTags = "";
-
+        // Player voice UI state
+        private string _playerSearch = "";
+        private string _newPlayerName = "";
+        private string _newPlayerVoice = "";
         public ConfigWindow(Plugin plugin)
             : base("NPC Voice Master##NpcVoiceMasterConfig", ImGuiWindowFlags.None)
         {
@@ -95,6 +98,13 @@ namespace NPCVoiceMaster
                 if (ImGui.BeginTabItem("Tag Voices"))
                 {
                     DrawTab_TagVoices();
+                    ImGui.EndTabItem();
+                }
+
+                // Player voices tab: list and assign voices for player characters.
+                if (ImGui.BeginTabItem("Player Voices"))
+                {
+                    DrawTab_PlayerVoices();
                     ImGui.EndTabItem();
                 }
 
@@ -429,6 +439,116 @@ if (ImGui.Button($"Reserve (remove default)##vp_resbtn_{voice}"))
             }
 
             ImGui.EndChild();
+        }
+
+        // Draw the Player Voices tab. Allows users to assign, edit and remove voice profiles for player characters.
+        private void DrawTab_PlayerVoices()
+        {
+            ImGui.TextUnformatted("Player voice assignments.");
+            ImGui.Separator();
+
+            // Filter players via search text
+            ImGui.SetNextItemWidth(300);
+            ImGui.InputTextWithHint("##player_search", "Search players...", ref _playerSearch, 256);
+
+            ImGui.Spacing();
+            ImGui.TextUnformatted("Add / edit player voice assignment");
+            ImGui.SetNextItemWidth(260);
+            ImGui.InputTextWithHint("##new_player_name", "Player Name (exact)", ref _newPlayerName, 128);
+
+            // Build list of available voices from configured profiles
+            var voiceList = _plugin.Configuration.VoiceProfiles != null
+                ? _plugin.Configuration.VoiceProfiles.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList()
+                : new List<string>();
+
+            // Initialize the new player voice selection if it hasn't been set and voices exist
+            if (string.IsNullOrEmpty(_newPlayerVoice) && voiceList.Count > 0)
+            {
+                _newPlayerVoice = voiceList[0];
+            }
+
+            // Drop-down for selecting voice for the new player
+            ImGui.SetNextItemWidth(260);
+            var comboLabel = string.IsNullOrEmpty(_newPlayerVoice) ? "(none)" : _newPlayerVoice;
+            if (ImGui.BeginCombo("Voice##new_player_voice", comboLabel))
+            {
+                foreach (var v in voiceList)
+                {
+                    bool isSelected = (_newPlayerVoice == v);
+                    if (ImGui.Selectable(v, isSelected))
+                    {
+                        _newPlayerVoice = v;
+                    }
+                    if (isSelected)
+                        ImGui.SetItemDefaultFocus();
+                }
+                ImGui.EndCombo();
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button("Assign##assign_player_voice"))
+            {
+                if (!string.IsNullOrWhiteSpace(_newPlayerName) && !string.IsNullOrWhiteSpace(_newPlayerVoice))
+                {
+                    _plugin.PlayerVoiceManager?.AssignVoiceToPlayer(_newPlayerName.Trim(), _newPlayerVoice.Trim());
+                    _status = $"Assigned '{_newPlayerVoice}' to player '{_newPlayerName}'.";
+                    // Clear name field after assignment
+                    _newPlayerName = "";
+                }
+            }
+
+            // Divider before existing assignments list
+            ImGui.Separator();
+            ImGui.TextUnformatted("Current player assignments");
+
+            var assignments = _plugin.PlayerVoiceManager != null
+                ? _plugin.PlayerVoiceManager.GetAllPlayerVoices()
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            var players = assignments.Keys.ToList();
+            players.Sort(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var player in players)
+            {
+                // Apply search filter
+                if (!string.IsNullOrWhiteSpace(_playerSearch) &&
+                    !player.Contains(_playerSearch, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                assignments.TryGetValue(player, out var assignedVoice);
+                var currentVoice = assignedVoice ?? "";
+
+                // Show player name
+                ImGui.TextUnformatted(player);
+                ImGui.SameLine();
+
+                // Drop-down for editing existing player voice
+                ImGui.SetNextItemWidth(200);
+                var currentLabel = string.IsNullOrEmpty(currentVoice) ? "(none)" : currentVoice;
+                if (ImGui.BeginCombo($"##player_voice_{player}", currentLabel))
+                {
+                    foreach (var v in voiceList)
+                    {
+                        bool isSelected = (currentVoice == v);
+                        if (ImGui.Selectable(v, isSelected))
+                        {
+                            currentVoice = v;
+                            _plugin.PlayerVoiceManager?.AssignVoiceToPlayer(player, currentVoice);
+                            _status = $"Updated '{player}' voice to '{currentVoice}'.";
+                        }
+                        if (isSelected)
+                            ImGui.SetItemDefaultFocus();
+                    }
+                    ImGui.EndCombo();
+                }
+
+                ImGui.SameLine();
+                if (ImGui.Button($"Remove##remove_player_{player}"))
+                {
+                    _plugin.PlayerVoiceManager?.RemoveVoiceFromPlayer(player);
+                    _status = $"Removed voice assignment for player '{player}'.";
+                }
+            }
         }
 
         private void DrawTab_TagNpcs()
