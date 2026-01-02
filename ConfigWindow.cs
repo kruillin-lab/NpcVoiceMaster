@@ -228,8 +228,7 @@ namespace NPCVoiceMaster
                     foreach (var t in suggested)
                         TagUtil.AddTag(vp.Tags, t);
 
-                    if (vp.Tags.Count == 0)
-                        TagUtil.AddTag(vp.Tags, "default");
+                    // If no tags, leave empty so voice remains eligible for generic fallback.
 
                     NormalizeTagsInPlace(vp.Tags);
                 }

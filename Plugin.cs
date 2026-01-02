@@ -201,7 +201,28 @@ Svc.AddonLifecycle.RegisterListener(AddonEvent.PostDraw, "Talk", OnTalkPostDraw)
             {
                 // Swallow cleanup failures; they should not block plugin initialization.
             }
-        }
+        
+
+            // Auto-populate voice list from AllTalk on startup when configuration is empty/suspiciously small.
+            // This avoids the "everything defaults to one voice" problem when only one voice profile exists.
+            try
+            {
+                if (Configuration.VoiceProfiles == null || Configuration.VoiceProfiles.Count < 2)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        var voices = await FetchAllTalkVoicesAsync();
+                        if (voices.Count > 0)
+                        {
+                            // Populate tags from filenames without forcing a "default" tag.
+                            AutoBucketVoicesFromNames(voices, clearBucketsFirst: Configuration.VoiceProfiles == null || Configuration.VoiceProfiles.Count == 0);
+                        }
+                    });
+                }
+            }
+            catch { }
+
+}
 
         public void Dispose()
         {
@@ -1026,6 +1047,25 @@ public string PreviewVoiceForNpc(string npcName)
     if (eligible.Count == 0)
         eligible = all;
 
+    // Prefer gender-matching voices when we can infer gender (but never go silent).
+    var genderTag = GetPreferredGenderTagForNpc(npcName);
+    if (!string.IsNullOrWhiteSpace(genderTag) && Configuration.VoiceProfiles != null)
+    {
+        var genderPool = new List<string>(eligible.Count);
+        foreach (var v in eligible)
+        {
+            if (Configuration.VoiceProfiles.TryGetValue(v, out var vp) && vp != null)
+            {
+                var vt = TagUtil.ToSet(vp.Tags);
+                if (vt.Contains(genderTag))
+                    genderPool.Add(v);
+            }
+        }
+
+        if (genderPool.Count > 0)
+            eligible = genderPool;
+    }
+
     return eligible[_rng.Next(eligible.Count)];
 }
 
@@ -1518,9 +1558,8 @@ private void SetBucketForCurrentTarget(string bucketName)
 
                 vp.Tags = TagUtil.NormDistinct(vp.Tags);
 
-                // If we still have no tags, keep it eligible for fallback.
-                if (vp.Tags.Count == 0)
-                    TagUtil.AddTag(vp.Tags, "default");
+                // If still no tags, leave empty so it remains eligible for generic fallback/resolution.
+                // (Do NOT force a "default" tag, as that collapses variety and can cause one-voice domination.)
             }
 
             Configuration.Save();
@@ -1667,7 +1706,7 @@ private void SetBucketForCurrentTarget(string bucketName)
             var lower = n.ToLowerInvariant();
             var tokens = TokenSplit.Split(lower).Where(t => !string.IsNullOrWhiteSpace(t)).ToHashSet();
 
-            if (tokens.Contains("lady") || tokens.Contains("miss") || tokens.Contains("madam") || tokens.Contains("mrs") || tokens.Contains("sister"))
+            if (tokens.Contains("lady") || tokens.Contains("miss") || tokens.Contains("ms") || tokens.Contains("madam") || tokens.Contains("mrs") || tokens.Contains("sister"))
                 return "woman";
 
             if (tokens.Contains("sir") || tokens.Contains("lord") || tokens.Contains("mr") || tokens.Contains("brother"))
@@ -1676,7 +1715,25 @@ private void SetBucketForCurrentTarget(string bucketName)
             return "";
         }
 
-        // ============================================================
+        
+
+        private string GetPreferredGenderTagForNpc(string npcName)
+        {
+            // Prefer real gender from game object metadata when available, otherwise fall back to name/title tokens.
+            try
+            {
+                if (TryGetNpcGenderFromMetadata(npcName, out var g))
+                {
+                    // Customize[1]: 0 = male, 1 = female (common convention)
+                    if (g == 0) return "male";
+                    if (g == 1) return "woman";
+                }
+            }
+            catch { }
+
+            return GuessGenderBucketFromName(npcName);
+        }
+// ============================================================
         // Named-voice auto match (exact + first-name alias)
         // ============================================================
         private string ResolveVoiceForNpc(string npcName)
@@ -1951,8 +2008,6 @@ private void SetBucketForCurrentTarget(string bucketName)
                 if (!string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon))
                     score += 100;
 
-                // Tiny bonus for richer tagging (helps prefer well-tagged voices when tied).
-                score += Math.Min(voiceTags.Count, 6);
 
                 scoredAll.Add((voiceName, score, voiceAccentCanon));
             }
