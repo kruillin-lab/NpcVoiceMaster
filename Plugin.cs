@@ -1602,6 +1602,22 @@ private void SetBucketForCurrentTarget(string bucketName)
 
             try
             {
+                // Fast path: Dalamud exposes Customize directly on ICharacter.
+                if (obj is ICharacter ch)
+                {
+                    var c = ch.Customize;
+                    var idx = (int)CustomizeIndex.Gender;
+                    if (c != null && c.Length > idx)
+                    {
+                        var g = c[idx];
+                        if (g == 0 || g == 1)
+                        {
+                            gender = g;
+                            return true;
+                        }
+                    }
+                }
+
                 var t = obj.GetType();
                 var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
@@ -1920,44 +1936,89 @@ private void SetBucketForCurrentTarget(string bucketName)
 
             var npcAccentCanon = CanonAccent(npcProfile?.Accent);
 
-            // Score each enabled voice (tags first, accent heavily weighted).
-            var scoredAll = new List<(string Voice, int Score, string AccentCanon)>();
-
-            foreach (var kv in Configuration.VoiceProfiles)
+            // Try to infer gender from in-game character customize data (best-effort).
+            // We only apply this automatically if the NPC is not already explicitly gender-tagged.
+            string? inferredGenderTag = null;
+            if (TryGetNpcGenderFromMetadata(npcName, out var g))
             {
-                var voiceName = (kv.Key ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(voiceName)) continue;
-
-                var vp = kv.Value;
-                if (vp == null || !vp.Enabled) continue;
-
-                var voiceTags = TagUtil.ToSet(vp.Tags);
-
-                // Required tags must all match.
-                if (required.Count > 0 && !required.All(t => voiceTags.Contains(t)))
-                    continue;
-
-                var score = 0;
-
-                // Preferred tag matches add points.
-                foreach (var t in preferred)
-                    if (voiceTags.Contains(t)) score += 10;
-
-                // Having required tags at all is a mild bonus (keeps "default" from swamping everything).
-                score += required.Count;
-
-                // Accent: BIG boost (tone intentionally ignored).
-                var voiceAccentCanon = CanonAccent(vp.Accent);
-                if (!string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon))
-                    score += 100;
-
-                // Tiny bonus for richer tagging (helps prefer well-tagged voices when tied).
-                score += Math.Min(voiceTags.Count, 6);
-
-                scoredAll.Add((voiceName, score, voiceAccentCanon));
+                if (g == 0) inferredGenderTag = "male";
+                else if (g == 1) inferredGenderTag = "woman";
             }
 
-            if (scoredAll.Count == 0)
+            if (!string.IsNullOrWhiteSpace(inferredGenderTag))
+            {
+                LastDetectedGender = inferredGenderTag;
+            }
+
+            // Score each enabled voice (tags first, accent heavily weighted).
+            var hasExplicitGenderTag =
+                required.Contains("male") || required.Contains("woman") || required.Contains("boy") || required.Contains("girl") ||
+                preferred.Contains("male") || preferred.Contains("woman") || preferred.Contains("boy") || preferred.Contains("girl");
+
+            var applyInferredGender = !hasExplicitGenderTag && !string.IsNullOrWhiteSpace(inferredGenderTag);
+
+            List<(string Voice, int Score, string AccentCanon)> ScoreVoices(HashSet<string> req)
+            {
+                var scored = new List<(string Voice, int Score, string AccentCanon)>();
+
+                foreach (var kv in Configuration.VoiceProfiles)
+                {
+                    var voiceName = (kv.Key ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(voiceName)) continue;
+
+                    var vp = kv.Value;
+                    if (vp == null) continue;
+                    if (!vp.Enabled) continue;
+
+                    // Reserved voices are opt-in; they only participate if explicitly required/preferred.
+                    if (vp.Reserved)
+                    {
+                        // If any of the NPC tags explicitly include this voice name, allow it.
+                        // Otherwise, keep it out of auto-selection.
+                        if (!required.Contains(TagUtil.Norm(voiceName)) && !preferred.Contains(TagUtil.Norm(voiceName)))
+                            continue;
+                    }
+
+                    var voiceTags = TagUtil.ToSet(vp.Tags);
+
+                    // Required tags must all match.
+                    if (req.Count > 0 && !req.All(t => voiceTags.Contains(t)))
+                        continue;
+
+                    var score = 0;
+
+                    // Preferred tag matches add points.
+                    foreach (var t in preferred)
+                        if (voiceTags.Contains(t)) score += 10;
+
+                    // Having required tags at all is a mild bonus (keeps "default" from swamping everything).
+                    score += req.Count;
+
+                    // Accent: BIG boost (tone intentionally ignored).
+                    var voiceAccentCanon = CanonAccent(vp.Accent);
+                    if (!string.IsNullOrWhiteSpace(npcAccentCanon) && AccentMatches(npcAccentCanon, voiceAccentCanon))
+                        score += 100;
+
+                    // Tiny bonus for richer tagging (helps prefer well-tagged voices when tied).
+                    score += Math.Min(voiceTags.Count, 6);
+
+                    scored.Add((voiceName, score, voiceAccentCanon));
+                }
+
+                return scored;
+            }
+
+            // First pass: apply inferred gender as a required tag if we have it and NPC isn't explicitly gender-tagged.
+            var requiredEffective = new HashSet<string>(required, StringComparer.OrdinalIgnoreCase);
+            if (applyInferredGender)
+                requiredEffective.Add(inferredGenderTag!);
+
+            var scoredAll = ScoreVoices(requiredEffective);
+
+            // If gender inference yields zero matches (common for monsters/machines), fall back gracefully.
+            if (scoredAll.Count == 0 && applyInferredGender)
+                scoredAll = ScoreVoices(required);
+if (scoredAll.Count == 0)
                 return "";
 
             // Accent filtering: if NPC has an accent and at least one voice matches, restrict to those.
